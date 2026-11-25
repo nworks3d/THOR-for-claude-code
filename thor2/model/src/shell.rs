@@ -1326,7 +1326,7 @@ pub const WRAPPER_PROGRAMS: &[&str] = &[
 ];
 
 /// The index of the word after a wrapper's own options. `at` is the index of the wrapper word.
-fn skip_wrapper(name: &str, words: &[String], at: usize) -> usize {
+pub fn skip_wrapper(name: &str, words: &[String], at: usize) -> usize {
     let mut i = at + 1;
     let flag = |i: usize| words.get(i).is_some_and(|w| w.starts_with('-') && w.len() > 1);
     // `-x value`: the option itself is the whole word and takes the next as its value; `-xvalue` and

@@ -799,17 +799,13 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
             return true;
         }
         // `echo <file> | xargs rm`: xargs puts what it reads at the end of the command it runs.
-        // (The list of programs that run another program is shared in `model::shell`; this reads
-        // only xargs, until that list is used here.)
         if at > 0 && segments[at - 1].2 && depth < 4 {
             if let (Some((printer, literal)), Some((runner, inner))) = (leader_of(&segments[at - 1].0), leader_of(words)) {
                 if runner == "xargs" && matches!(printer.as_str(), "echo" | "printf" | "write-output") {
-                    let mut i = 0;
-                    while i < inner.len() && inner[i].starts_with('-') {
-                        i += if matches!(inner[i].as_str(), "-I" | "-n" | "-P" | "-d" | "-E" | "-L" | "-s" | "-a" | "-J") { 2 } else { 1 };
-                    }
-                    if i < inner.len() {
-                        let mut synthetic: Vec<String> = inner[i..].to_vec();
+                    let leader_at = words.len() - inner.len() - 1;
+                    let i = model::shell::skip_wrapper("xargs", words, leader_at);
+                    if i < words.len() {
+                        let mut synthetic: Vec<String> = words[i..].to_vec();
                         synthetic.extend(literal.iter().cloned());
                         if segment_writes_protected(p, &synthetic, here.as_deref(), depth + 1, command) {
                             return true;
@@ -1183,14 +1179,10 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
                 || (depth < 3 && !command.is_empty() && command_writes_protected(p, &command, cwd, depth + 1))
         }
         "busybox" => depth < 3 && segment_writes_protected(p, rest, cwd, depth + 1, source),
-        "xargs" => {
-            // The command xargs runs: skip its own options (and their values).
-            let mut i = 0;
-            while i < rest.len() && rest[i].starts_with('-') {
-                let takes_value = matches!(rest[i].as_str(), "-I" | "-n" | "-P" | "-d" | "-E" | "-L" | "-s" | "-a" | "-J" | "--max-args" | "--max-procs" | "--delimiter" | "--arg-file" | "--replace");
-                i += if takes_value { 2 } else { 1 };
-            }
-            depth < 3 && i < rest.len() && segment_writes_protected(p, &rest[i..], cwd, depth + 1, source)
+        // A program that only carries another along (`xargs rm`, `timeout 5 cp`): the command it runs.
+        n if model::shell::WRAPPER_PROGRAMS.contains(&n) => {
+            let i = model::shell::skip_wrapper(n, words, at);
+            depth < 3 && i < words.len() && segment_writes_protected(p, &words[i..], cwd, depth + 1, source)
         }
         // Only the forms that write a file: `-hashfile` and `-dump` only read.
         "certutil" => {
