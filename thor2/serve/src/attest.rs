@@ -1603,7 +1603,10 @@ pub fn lines_with_owner_messages(file: &Path, owners: usize) -> Vec<String> {
             buf
         };
         let lines: Vec<String> = String::from_utf8_lossy(&body).lines().map(str::to_string).collect();
-        found += lines.iter().filter(|l| l.contains("\"user\"") && owner_text(l).is_some()).count();
+        found += lines
+            .iter()
+            .filter(|l| (l.contains("\"user\"") || l.contains("\"queued_command\"")) && owner_text(l).is_some())
+            .count();
         blocks.push(lines);
         end = start;
         if found >= owners || len - end >= OWNER_READ_MAX_BYTES || began.elapsed() > OWNER_READ_BUDGET {
@@ -1618,6 +1621,9 @@ pub fn lines_with_owner_messages(file: &Path, owners: usize) -> Vec<String> {
 /// not a message he typed (see `owner_messages`).
 pub fn owner_text(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) == Some("attachment") {
+        return queued_owner_text(&v);
+    }
     if v.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }
@@ -1643,6 +1649,38 @@ pub fn owner_text(line: &str) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        _ => return None,
+    };
+    owner_own_text(&text)
+}
+
+/// A message the owner typed while a turn was running: Claude Code saves it as an `attachment`
+/// line of type `queued_command` (mode `prompt`), not as a `user` line, and THOR's prompt record
+/// holds it all the same. Without it the saved conversation and the record fell one place out of
+/// step and no message counted, so a go typed mid-turn and the go after it were both refused
+/// (2026-11-25). A queued prompt that starts a turn of its own is saved as a `user` line only.
+fn queued_owner_text(v: &Value) -> Option<String> {
+    if v.get("isSidechain").and_then(|f| f.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let a = v.get("attachment")?;
+    if a.get("type").and_then(|t| t.as_str()) != Some("queued_command") {
+        return None;
+    }
+    if a.get("commandMode").and_then(|m| m.as_str()) != Some("prompt") {
+        return None;
+    }
+    if a.get("origin").and_then(|o| o.get("kind")).and_then(|k| k.as_str()) != Some("human") {
+        return None;
+    }
+    let text = match a.get("prompt") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => return None,
     };
     owner_own_text(&text)
@@ -3560,6 +3598,37 @@ mod step_26_tests {
         assert!(says_marker(&all[0], "go-owner"), "{all:?}");
         assert!(owner_messages(&dir.path().join("missing.jsonl"), 2).is_err());
         assert!(says_marker("ok, Go-Owner.", "go-owner") && !says_marker("go-owners", "go-owner") && !says_marker("nogo-owner", "go-owner"));
+    }
+
+    #[test]
+    fn a_message_typed_while_a_turn_runs_is_his_and_keeps_the_record_in_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        let db = dir.path().join("thor.db");
+        let user = |text: &str| line(serde_json::json!({"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": text}}));
+        let queued = |text: &str, kind: &str, mode: &str| {
+            line(serde_json::json!({
+                "type": "attachment", "isSidechain": false,
+                "attachment": {"type": "queued_command", "prompt": text, "commandMode": mode, "origin": {"kind": kind}, "humanTurn": true},
+            }))
+        };
+        let text = [
+            user("takes too long"),
+            queued("go-owner", "human", "prompt"),
+            queued("<task-notification>done</task-notification>", "task-notification", "task-notification"),
+            queued("peer go-owner", "peer", "prompt"),
+            user("go-owner"),
+        ]
+        .concat();
+        std::fs::write(&transcript, text).unwrap();
+        // What the prompt hook recorded: the mid-turn message too.
+        for (n, said) in ["takes too long", "go-owner", "go-owner"].iter().enumerate() {
+            crate::prompt_record::record(&db, "s", said, n as i64);
+        }
+        let words = owner_messages(&transcript, 2).unwrap();
+        assert_eq!(words, vec!["go-owner".to_string(), "go-owner".to_string()], "the queued message is his, the others are not");
+        let pairs = words.into_iter().map(|w| (w, String::new())).collect();
+        assert_eq!(crate::prompt_record::confirmed_pairs(&db, Some("s"), pairs).len(), 2, "saved conversation and record are in step");
     }
 
     #[test]
