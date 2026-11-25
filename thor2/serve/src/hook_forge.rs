@@ -61,19 +61,34 @@ fn subcommand_of(words: &[String]) -> Option<String> {
 /// `--no-record` (writes nothing at all), `--diagnose` (never writes the owner's prompt record, an
 /// evaluation start or a move of the setting-file record), and the calls that only ask for help or the
 /// version (AGENTS.md: such a call is never refused).
-const PROBE_FLAGS: [&str; 6] = ["--no-record", "--diagnose", "--help", "-h", "--version", "-v"];
+///
+/// Exactly the flags `serve` really honours, each proven to end the run before any write
+/// (`serve/tests/probe_hook_writes_no_evidence.rs`): `--version` and `-V` are answered before the
+/// arguments are parsed (`thor_core::is_version_flag`), `--help` and `-h` are clap's and print and
+/// exit, `--no-record` writes nothing, and `--diagnose` writes no evidence. `-v` is no flag of
+/// `serve`, and the match is case-sensitive.
+const PROBE_FLAGS: [&str; 6] = ["--no-record", "--diagnose", "--help", "-h", "--version", "-V"];
+
+/// A word without the quotes, backticks and backslashes that hide it, case kept.
+fn unhidden(word: &str) -> String {
+    word.chars().filter(|c| !matches!(c, '\\' | '`' | '\'' | '"')).collect()
+}
 
 /// Does a word among these carry one of the probe flags (the words may hold several arguments)?
 fn is_a_probe(words: &[String]) -> bool {
-    words.iter().flat_map(|w| w.split_whitespace()).any(|w| PROBE_FLAGS.contains(&bare(w).as_str()))
+    words.iter().flat_map(|w| w.split_whitespace()).any(|w| PROBE_FLAGS.contains(&unhidden(w).as_str()))
 }
 
 /// Programs that only carry another program and its words along: what stands between them and the
 /// program they run is flags, their values, numbers (a time limit, a niceness) and `NAME=value`.
-const WRAPPERS: [&str; 22] = [
-    "timeout", "env", "nice", "ionice", "stdbuf", "time", "sudo", "doas", "nohup", "exec", "command", "builtin", "call", "setsid",
-    "start", "start-process", "saps", "invoke-command", "icm", "invoke-expression", "iex", "xargs",
-];
+///
+/// The wrappers the general command reading unwraps (`model::shell::WRAPPER_PROGRAMS`, ONE list for
+/// both) plus the PowerShell launchers, which only this check reads.
+const LAUNCHERS: [&str; 6] = ["start", "start-process", "saps", "invoke-command", "icm", "invoke-expression"];
+
+fn is_a_wrapper(name: &str) -> bool {
+    model::shell::WRAPPER_PROGRAMS.contains(&name) || LAUNCHERS.contains(&name) || name == "iex"
+}
 
 /// Flags of the wrappers that take the next word as their value (`sudo -u bob`, `timeout -s KILL`).
 const VALUE_FLAGS: [&str; 12] = ["-u", "-g", "-s", "-k", "-n", "-c", "-p", "-C", "--user", "--group", "--signal", "--kill-after"];
@@ -99,7 +114,7 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
         let toks = tokens(&joined);
         if toks.iter().any(|t| t == "serve" || t == "serve.exe")
             && toks.iter().any(|t| t == "hook")
-            && !toks.iter().any(|t| PROBE_FLAGS.contains(&t.as_str()))
+            && !joined.split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))).any(|t| PROBE_FLAGS.contains(&t))
         {
             return true;
         }
@@ -143,7 +158,7 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
             }
             _ => {}
         }
-        if SHELLS.contains(&name.as_str()) || WRAPPERS.contains(&name.as_str()) {
+        if SHELLS.contains(&name.as_str()) || is_a_wrapper(&name) {
             wrapped = true;
             via_xargs |= name == "xargs";
             after_flag = false;

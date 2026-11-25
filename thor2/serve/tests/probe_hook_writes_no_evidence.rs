@@ -92,3 +92,54 @@ fn a_no_record_run_leaves_the_whole_store_folder_as_it_was() {
     assert_eq!(files(&store).keys().collect::<Vec<_>>(), before.keys().collect::<Vec<_>>(), "no new file");
     assert_eq!(files(&store), before, "no file changed");
 }
+
+/// `serve` run with exactly these arguments and the payload on stdin.
+fn run_args(args: &[String], payload: serde_json::Value) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
+    cmd.args(args);
+    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT").env_remove("CLAUDE_CODE_SESSION_ATTENDED");
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn serve");
+    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
+    child.wait_with_output().expect("wait serve");
+}
+
+/// The flags `serve::hook_forge` lets through, each before and after `hook`: the run ends before any
+/// write (`--no-record`, `--help`, `-h`, `--version`, `-V`), or at least before any evidence
+/// (`--diagnose`: no owner record, no evaluation start, the setting-file record where it was).
+#[test]
+fn each_probe_flag_ends_the_run_before_any_evidence_is_written() {
+    for flag in ["--no-record", "--diagnose", "--help", "-h", "--version", "-V"] {
+        for before in [false, true] {
+            let (dir, db, work) = fixture();
+            let store = dir.path().join("store");
+            run_hook(&db, &[], start(&work));
+            std::fs::write(store.join("stale-guard-mode.json"), r#"{"mode": "off"}"#).unwrap();
+            let all_before = files(&store);
+            let (db_s, flag_s) = (db.to_string_lossy().to_string(), flag.to_string());
+            let args: Vec<String> = if before {
+                vec!["--db".into(), db_s, flag_s, "hook".into()]
+            } else {
+                vec!["--db".into(), db_s, "hook".into(), flag_s]
+            };
+            let typed = serde_json::json!({ "hook_event_name": "UserPromptSubmit", "session_id": "probe-1", "cwd": work.to_string_lossy(), "prompt": "/thor-eval" });
+            for payload in [prompt(&work), start(&work), typed] {
+                run_args(&args, payload);
+            }
+            let after = files(&store);
+            assert!(!after.contains_key("owner-prompts.jsonl"), "{flag} (before hook: {before}): no owner record");
+            assert_eq!(after["mode-files-seen.json"], all_before["mode-files-seen.json"], "{flag} (before: {before}): the setting-file record did not move");
+            if flag != "--diagnose" {
+                assert_eq!(after, all_before, "{flag} (before hook: {before}): the store folder is byte-identical");
+            }
+        }
+    }
+}
+
+/// `-v` is no flag of `serve`: it is not on the list, so a hand run with it is still refused.
+#[test]
+fn a_flag_serve_does_not_honour_is_not_a_probe() {
+    for command in ["serve.exe --db x hook -v", "serve.exe --db x hook --verbose", "serve.exe --db x hook -H"] {
+        let input = serde_json::json!({ "command": command });
+        assert!(serve::hook_forge::refusal("Bash", Some(&input)).is_some(), "{command}");
+    }
+}

@@ -155,6 +155,28 @@ fn the_owner_saying_it_in_his_own_message_lets_the_call_through() {
 }
 
 #[test]
+fn a_guarded_command_behind_a_wrapper_still_needs_the_owners_go() {
+    let fx = Fx::new(approval());
+    fx.write_transcript(&[owner("please look at the prod logs")]);
+    for command in [
+        "echo x | xargs deploy-prod --now",
+        "timeout 5 deploy-prod --now",
+        "env -i FOO=1 deploy-prod --now",
+        "find . -name x -exec deploy-prod {} \\;",
+        "stdbuf -oL deploy-prod --now",
+        "sudo -u bob deploy-prod --now",
+    ] {
+        assert!(blocked(&fx.bash(command)), "{command}");
+    }
+    for command in ["timeout 5 cargo test", "env FOO=1 npm test", "find . -name x -exec grep y {} \\;", "echo deploy-prod | xargs grep y", "time git status"] {
+        assert!(!blocked(&fx.bash(command)), "{command}");
+    }
+    // With his go in his own message the wrapped command passes like the bare one.
+    fx.write_transcript(&[owner("ok, deploy it now - go-owner")]);
+    assert!(!blocked(&fx.bash("echo x | xargs deploy-prod --now")));
+}
+
+#[test]
 fn a_go_word_only_in_the_saved_conversation_is_no_go_and_a_typed_one_is() {
     let fx = Fx::new(approval());
     // The owner typed something harmless; a line with the go-word was appended to the saved conversation.
