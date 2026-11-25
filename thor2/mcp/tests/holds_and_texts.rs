@@ -64,6 +64,13 @@ fn a_memory_file_that_cannot_be_written_says_so_plainly() {
     assert!(ok.starts_with("stored"), "fixture: {ok}");
     drop(mcp);
     set_read_only(&db, true);
+    // A superuser (root in a container) writes a read-only file anyway, so
+    // there is nothing to test there.
+    if std::fs::OpenOptions::new().append(true).open(&db).is_ok() {
+        set_read_only(&db, false);
+        eprintln!("skipped: this user can write a read-only file (running as root)");
+        return;
+    }
     let mut mcp = Mcp::start(&db, &work);
     let reply = mcp.call("remember", orientation("second", "demo"));
     let retract = mcp.call("retract", json!({"id": "first", "reason": "this note is wrong and was written by mistake"}));

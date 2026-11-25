@@ -78,8 +78,11 @@ fn said(out: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
+/// THOR's hook entries in a settings text. Windows writes the program and an
+/// `args` list (`"hook"` is its own element); other systems write one shell
+/// command string that ends in ` hook`.
 fn hook_entries(text: &str) -> usize {
-    text.matches("\"hook\"").count()
+    text.matches("\"hook\"").count() + text.matches(" hook\"").count()
 }
 
 #[test]

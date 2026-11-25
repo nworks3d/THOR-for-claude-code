@@ -91,6 +91,10 @@ fn fresh_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let db = dir.path().join("thor.db");
     thor_core::event_store::EventStore::new(&db).unwrap();
     std::fs::write(dir.path().join("guard-response-rulebook.json"), LIST_RULEBOOK).unwrap();
+    // These payloads carry a transcript but no project folder. Where the test
+    // runs outside a git checkout (a source archive), the folder-of-no-project
+    // hold would answer first; it is not what this file tests.
+    std::fs::write(dir.path().join("no-project-ask-mode.json"), r#"{"mode": "off"}"#).unwrap();
     (dir, db)
 }
 
