@@ -220,6 +220,10 @@ pub enum StartRefused {
     /// The log could not be read or written (a hook run that holds the store
     /// read-only included).
     Store,
+    /// Reading the owner's messages for the evaluation took longer than one
+    /// Stop may spend; the progress is saved and nothing was started or
+    /// changed. The next start goes on from there.
+    SaidPending,
 }
 
 /// `start`, saying why it started nothing (`StartRefused`).
@@ -296,6 +300,10 @@ pub fn try_begin_in(
             return Err(StartRefused::RunningElsewhere { start: other.clone(), idle_minutes });
         }
     }
+    // The owner's messages are read before anything is written, under a time
+    // box: when it runs out nothing is superseded or started, and the next
+    // start goes on from the saved progress.
+    let said = crate::said::freeze(db, transcripts, project, now).map_err(|_| StartRefused::SaidPending)?;
     for other in &others {
         let idle_minutes = crate::usefulness::session_idle_minutes(
             store,
@@ -313,7 +321,7 @@ pub fn try_begin_in(
     }
     let mut frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
     frozen.report_id = model::store::free_evaluation_report_id(store, project, &start_date(&frozen));
-    frozen.said = crate::said::freeze(db, transcripts, project, now);
+    frozen.said = said;
     let id = model::store::evaluation_start_id(project, frozen.started_seq);
     let item = Item {
         id: id.clone(),

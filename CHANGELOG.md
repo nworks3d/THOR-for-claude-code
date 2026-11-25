@@ -23,6 +23,7 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **The notes beside the memory stay whole when many conversations end at once.** They are written in one piece and no longer lose an update or end up with extra text behind them, and a file that cannot be read is kept as it is instead of being emptied.
 - **The end-of-turn upkeep no longer starves.** When one step was slow, the steps behind it, such as the weekly check and the report check, could be skipped turn after turn. The steps one turn did not reach now go first at the next one.
 - **`serve sweep` no longer hangs on the route check.** It now stops at its time limit and says how far it got, and it searches the record of calls much faster.
+- **Starting the weekly check is much faster.** Reading what you typed since the last check no longer makes the end of a turn wait for a minute; if it ever needs longer, the check simply starts one turn end later, with the same list.
 - **A note you silenced no longer owes a verdict for ever.** A note that was marked as not belonging at every place it fired is no longer counted in the list of notes to judge, and no longer keeps the weekly check daily. If it fires somewhere new, it counts again.
 - **`doctor` names notes that exist in two versions.** Such a note is skipped everywhere, so a rule among them does nothing; doctor now lists them and says how to settle them.
 - **The weekly check says why it is daily.** The request and `doctor` now name the reason a project is on the daily rhythm.
