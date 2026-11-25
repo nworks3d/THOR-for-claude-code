@@ -1316,6 +1316,77 @@ fn ps_assigned_command(words: &[String], text: &str) -> Option<Vec<String>> {
     None
 }
 
+/// THE ONE LIST OF PROGRAMS THAT ONLY CARRY ANOTHER PROGRAM ALONG (`timeout 5 deploy`, `sudo -u bob
+/// deploy`, `env -i FOO=1 deploy`, `echo x | xargs deploy`). A segment that starts with one runs the
+/// program after it and its own options: `head_and_program` takes them off the front, so every rule
+/// binds to the wrapped command exactly as if it ran bare. `serve`'s hook-forge check reads the same
+/// list (`serve::hook_forge`); there is no second copy.
+pub const WRAPPER_PROGRAMS: &[&str] = &[
+    "timeout", "env", "nice", "ionice", "stdbuf", "time", "sudo", "doas", "nohup", "exec", "command", "builtin", "call", "setsid", "xargs",
+];
+
+/// The index of the word after a wrapper's own options. `at` is the index of the wrapper word.
+fn skip_wrapper(name: &str, words: &[String], at: usize) -> usize {
+    let mut i = at + 1;
+    let flag = |i: usize| words.get(i).is_some_and(|w| w.starts_with('-') && w.len() > 1);
+    // `-x value`: the option itself is the whole word and takes the next as its value; `-xvalue` and
+    // `--long=value` are one word.
+    let takes = |i: usize, with_value: &[&str]| words.get(i).is_some_and(|w| with_value.contains(&w.as_str()));
+    match name {
+        "sudo" => {
+            while flag(i) {
+                i += if takes(i, &["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U"]) { 2 } else { 1 };
+            }
+        }
+        "doas" => {
+            while flag(i) {
+                i += if takes(i, &["-u", "-C"]) { 2 } else { 1 };
+            }
+        }
+        "env" => {
+            while i < words.len() && (words[i].starts_with('-') || is_assignment(&words[i])) {
+                i += if words[i] == "-u" { 2 } else { 1 };
+            }
+        }
+        "nohup" | "exec" | "command" | "builtin" | "call" | "setsid" => {}
+        "time" => {
+            while flag(i) {
+                i += 1;
+            }
+        }
+        "nice" => {
+            if takes(i, &["-n"]) {
+                i += 2;
+            } else if flag(i) {
+                i += 1;
+            }
+        }
+        "ionice" => {
+            while flag(i) {
+                i += if takes(i, &["-c", "-n", "-p", "-P", "-t", "-u"]) { 2 } else { 1 };
+            }
+        }
+        "stdbuf" => {
+            while flag(i) {
+                i += if takes(i, &["-i", "-o", "-e"]) { 2 } else { 1 };
+            }
+        }
+        "timeout" => {
+            while flag(i) {
+                i += if takes(i, &["-s", "-k"]) { 2 } else { 1 };
+            }
+            i += 1; // the duration
+        }
+        "xargs" => {
+            while flag(i) {
+                i += if takes(i, &["-n", "-I", "-L", "-P", "-s", "-E", "-d", "-a"]) { 2 } else { 1 };
+            }
+        }
+        _ => {}
+    }
+    i
+}
+
 /// A word's last path part, lowercased, without a `.exe` suffix.
 fn base_lower(w: &str) -> String {
     let base = w.rsplit(['/', '\\']).next().unwrap_or(w).to_lowercase();
@@ -1342,38 +1413,11 @@ fn head_and_program(words: &[String], d: Dialect, text: &str) -> (Vec<String>, S
             i += 1;
             continue;
         }
-        match base_lower(w).as_str() {
-            "sudo" => {
-                i += 1;
-                while i < words.len() && words[i].starts_with('-') {
-                    let takes_arg = matches!(words[i].as_str(), "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-r" | "-t" | "-U");
-                    i += if takes_arg { 2 } else { 1 };
-                }
-            }
-            "env" => {
-                i += 1;
-                while i < words.len() && (words[i].starts_with('-') || is_assignment(&words[i])) {
-                    i += if words[i] == "-u" { 2 } else { 1 };
-                }
-            }
-            "nohup" | "exec" | "command" | "builtin" => i += 1,
-            "nice" => {
-                i += 1;
-                if i < words.len() && words[i] == "-n" {
-                    i += 2;
-                } else if i < words.len() && words[i].starts_with('-') {
-                    i += 1;
-                }
-            }
-            "timeout" => {
-                i += 1;
-                while i < words.len() && words[i].starts_with('-') {
-                    i += if matches!(words[i].as_str(), "-s" | "-k") { 2 } else { 1 };
-                }
-                i += 1; // the duration
-            }
-            _ => break,
+        let name = base_lower(w);
+        if !WRAPPER_PROGRAMS.contains(&name.as_str()) {
+            break;
         }
+        i = skip_wrapper(&name, words, i);
     }
     let mut out: Vec<String> = words[i.min(words.len())..].to_vec();
     let mut program = String::new();
@@ -1720,6 +1764,23 @@ fn wrapped_commands(head: &[String], heredoc: &str, d: Dialect) -> Vec<(String, 
                 // keeps a backslash literal.
                 out.push((inner, Dialect::PowerShell, false));
             }
+        }
+    } else if name == "find" {
+        // `find . -exec deploy {} \;`: what runs after -exec, -execdir, -ok or -okdir, up to the
+        // terminating `;` or `+`, is a command of its own.
+        let mut j = 0;
+        while j < rest.len() {
+            if matches!(rest[j].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+                let mut k = j + 1;
+                while k < rest.len() && !matches!(rest[k].as_str(), ";" | "\\;" | "+") {
+                    k += 1;
+                }
+                if k > j + 1 {
+                    out.push((rest[j + 1..k].join(" "), d, false));
+                }
+                j = k;
+            }
+            j += 1;
         }
     } else if name == "eval" && d == Dialect::Sh {
         let inner = rest.join(" ");

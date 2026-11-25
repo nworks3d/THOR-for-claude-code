@@ -182,8 +182,16 @@ fn describe(old: Option<&str>, new: &str) -> String {
 
 /// One plain line per watched file that differs from `before`: changed, new or removed, and one per
 /// file a Stop saw changed that has been put back since.
-fn lines_between(before: &BTreeMap<String, Seen>, now: &BTreeMap<String, Seen>, pending: &[(String, Option<Seen>)]) -> Vec<String> {
+fn lines_between(
+    before: &BTreeMap<String, Seen>,
+    now: &BTreeMap<String, Seen>,
+    pending: &[(String, Option<Seen>)],
+    installer: &BTreeMap<String, InstallerWrote>,
+) -> Vec<String> {
     let mut lines = Vec::new();
+    let mut warned = false;
+    // What the installer last wrote to a file (`None`: it removed it) and with which switch.
+    let by_installer = |name: &str, sha: Option<&str>| installer.get(name).filter(|w| Some(w.sha256.as_str()) == sha.or(Some(REMOVED)));
     for (name, seen) in now {
         let what = match before.get(name) {
             Some(old) if old.sha256 == seen.sha256 => continue,
@@ -191,19 +199,31 @@ fn lines_between(before: &BTreeMap<String, Seen>, now: &BTreeMap<String, Seen>, 
             None => "appeared",
         };
         let said = describe(before.get(name).map(|o| o.text.as_str()), &seen.text);
+        if let Some(wrote) = by_installer(name, Some(&seen.sha256)) {
+            lines.push(format!("[THOR] THOR's setting {name} was changed with {} (now: {said})", wrote.switch));
+            continue;
+        }
+        warned = true;
         lines.push(format!("[THOR] The setting file {name} {what} since the last session start. It now says: {said}"));
     }
     for (name, old) in before {
         if !now.contains_key(name) {
+            if let Some(wrote) = by_installer(name, None) {
+                lines.push(format!("[THOR] THOR's setting {name} was removed with {} (it used to say: {})", wrote.switch, old.excerpt));
+                continue;
+            }
+            warned = true;
             lines.push(format!("[THOR] The setting file {name} was removed since the last session start. It used to say: {}", old.excerpt));
         }
     }
     // A change a Stop saw and nobody can see now: made and put back.
     for (name, state) in pending {
         let same_as_before = now.get(name).map(|n| &n.sha256) == before.get(name).map(|b| &b.sha256);
-        if !same_as_before || lines.iter().any(|l| l.contains(&format!("setting file {name} "))) {
+        let by_the_installer = by_installer(name, state.as_ref().map(|s| s.sha256.as_str())).is_some();
+        if !same_as_before || by_the_installer || lines.iter().any(|l| l.contains(&format!("setting file {name} ")) || l.contains(&format!("setting {name} "))) {
             continue;
         }
+        warned = true;
         let said = match state {
             Some(s) => format!("it said: {}", describe(before.get(name).map(|o| o.text.as_str()), &s.text)),
             None => "it was removed".to_string(),
@@ -215,7 +235,7 @@ fn lines_between(before: &BTreeMap<String, Seen>, now: &BTreeMap<String, Seen>, 
         lines.truncate(MAX_LINES);
         lines.push(format!("[THOR] ... and {more} more setting file(s) changed since the last session start (doctor lists them)."));
     }
-    if !lines.is_empty() {
+    if warned {
         lines.push(
             "[THOR] If the owner did not ask for these changes himself, tell him in one plain sentence which file changed and what it now says, and do not change a setting file again without his word."
                 .to_string(),
@@ -227,7 +247,7 @@ fn lines_between(before: &BTreeMap<String, Seen>, now: &BTreeMap<String, Seen>, 
 /// The lines for what changed since the last session start, without moving the record (doctor).
 pub fn changed_lines(db: &Path) -> Vec<String> {
     match read_seen(db) {
-        Some(before) => lines_between(&before, &snapshot(db), &read_pending(db)),
+        Some(before) => lines_between(&before, &snapshot(db), &read_pending(db), &read_installer(db)),
         None => Vec::new(),
     }
 }
@@ -265,7 +285,7 @@ pub fn note_at_stop(db: &Path) {
 pub fn session_start_lines(db: &Path, record: bool) -> Vec<String> {
     let now = snapshot(db);
     let lines = match read_seen(db) {
-        Some(before) => lines_between(&before, &now, &read_pending(db)),
+        Some(before) => lines_between(&before, &now, &read_pending(db), &read_installer(db)),
         None => Vec::new(),
     };
     if record {
@@ -275,6 +295,57 @@ pub fn session_start_lines(db: &Path, record: bool) -> Vec<String> {
         let _ = std::fs::remove_file(pending_path(db));
     }
     lines
+}
+
+/// What THOR's own installer wrote to a watched file (`mode-files-installer.json` beside the memory).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstallerWrote {
+    /// The hash of the file as the installer left it, or `REMOVED` when it removed the file.
+    pub sha256: String,
+    /// The switch that did it, for example `install --set-language`.
+    pub switch: String,
+}
+
+/// The hash recorded for a file the installer removed.
+const REMOVED: &str = "removed";
+/// The record of what the installer wrote.
+pub const INSTALLER_FILE: &str = "mode-files-installer.json";
+
+fn installer_path(db: &Path) -> PathBuf {
+    db.with_file_name(INSTALLER_FILE)
+}
+
+fn read_installer(db: &Path) -> BTreeMap<String, InstallerWrote> {
+    std::fs::read_to_string(installer_path(db))
+        .ok()
+        .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_default()
+}
+
+/// THE INSTALLER'S HALF: `before` is `snapshot(db)` taken before one run of the installer under
+/// `switch` (for example `install --set-language`); every watched file that differs now was written
+/// by that run, and is recorded with the hash it has, so the next session start names the change
+/// neutrally ("was changed with ...") and a LATER hand edit, which differs from that hash, still
+/// gets the warning. Honest limit: an assistant can run the installer too, so the line names the
+/// switch and does not claim the owner ran it, and a hand edit that writes exactly the bytes the
+/// installer wrote counts as the installer's.
+pub fn record_installer_change(db: &Path, switch: &str, before: &BTreeMap<String, Seen>) {
+    let after = snapshot(db);
+    let mut recorded = read_installer(db);
+    let mut changed = false;
+    for name in before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>() {
+        let (was, is) = (before.get(name).map(|s| s.sha256.as_str()), after.get(name).map(|s| s.sha256.as_str()));
+        if was == is {
+            continue;
+        }
+        recorded.insert(name.clone(), InstallerWrote { sha256: is.unwrap_or(REMOVED).to_string(), switch: switch.to_string() });
+        changed = true;
+    }
+    if changed {
+        if let Ok(text) = serde_json::to_string(&recorded) {
+            let _ = crate::store_dir::write(&installer_path(db), text);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +385,79 @@ mod tests {
         // After that start it is said once.
         assert!(session_start_lines(&db, true).is_empty());
         assert!(changed_lines(&db).is_empty());
+    }
+
+    /// What one run of the installer does to a file: the run is wrapped the way `install` wraps it.
+    fn installer_run(db: &Path, switch: &str, write: impl FnOnce()) {
+        let before = snapshot(db);
+        write();
+        record_installer_change(db, switch, &before);
+    }
+
+    #[test]
+    fn a_change_made_with_the_installer_is_named_neutrally_once_and_a_later_hand_edit_is_a_warning() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("thor-mode.json");
+        std::fs::write(&file, r#"{"mode":"release"}"#).unwrap();
+        assert!(session_start_lines(&db, true).is_empty());
+
+        // The installer switches the language.
+        installer_run(&db, "install --set-language", || std::fs::write(&file, r#"{"mode":"release","language":"en"}"#).unwrap());
+        let said = session_start_lines(&db, true);
+        assert_eq!(said.len(), 1, "one neutral line and no warning: {said:?}");
+        assert!(said[0].starts_with("[THOR] THOR's setting thor-mode.json was changed with install --set-language (now: "), "{said:?}");
+        assert!(said[0].contains(r#""language":"en""#), "{said:?}");
+        assert!(!said[0].contains("did not ask"), "no warning wording: {said:?}");
+        assert!(session_start_lines(&db, true).is_empty(), "once");
+
+        // A hand edit after it differs from what the installer wrote: the warning is back.
+        std::fs::write(&file, r#"{"mode":"off","language":"en"}"#).unwrap();
+        let doctor = changed_lines(&db).join("\n");
+        assert!(doctor.contains("The setting file thor-mode.json changed") && doctor.contains("did not ask for these changes"), "{doctor}");
+        assert!(!doctor.contains("was changed with"), "{doctor}");
+        assert_eq!(session_start_lines(&db, true).join("\n"), doctor);
+    }
+
+    #[test]
+    fn an_installer_change_and_a_hand_edit_in_the_same_stretch_are_told_apart_per_file() {
+        let (dir, db) = fixture();
+        std::fs::write(dir.path().join("thor-mode.json"), r#"{"mode":"release"}"#).unwrap();
+        std::fs::write(dir.path().join("stale-guard-mode.json"), r#"{"mode": "on"}"#).unwrap();
+        session_start_lines(&db, true);
+        installer_run(&db, "install --set-mode", || std::fs::write(dir.path().join("thor-mode.json"), r#"{"mode":"test"}"#).unwrap());
+        std::fs::write(dir.path().join("stale-guard-mode.json"), r#"{"mode": "off"}"#).unwrap();
+        let text = session_start_lines(&db, true).join("\n");
+        assert!(text.contains("THOR's setting thor-mode.json was changed with install --set-mode"), "{text}");
+        assert!(text.contains("The setting file stale-guard-mode.json changed") && text.contains("did not ask for these changes"), "{text}");
+    }
+
+    #[test]
+    fn a_hand_edit_that_writes_the_installers_exact_bytes_counts_as_the_installers() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("thor-mode.json");
+        std::fs::write(&file, r#"{"mode":"release"}"#).unwrap();
+        session_start_lines(&db, true);
+        installer_run(&db, "install --set-mode", || std::fs::write(&file, r#"{"mode":"off"}"#).unwrap());
+        session_start_lines(&db, true);
+        // The file goes back by hand, then to the installer's exact bytes by hand: no way to tell it apart.
+        std::fs::write(&file, r#"{"mode":"release"}"#).unwrap();
+        assert!(changed_lines(&db).join("\n").contains("did not ask"), "a different edit is a warning");
+        session_start_lines(&db, true);
+        std::fs::write(&file, r#"{"mode":"off"}"#).unwrap();
+        let again = changed_lines(&db).join("\n");
+        assert!(again.contains("was changed with install --set-mode") && !again.contains("did not ask"), "the installer's bytes read as the installer's: {again}");
+    }
+
+    #[test]
+    fn a_file_the_installer_removed_is_named_neutrally() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("guard-response-rulebook.json");
+        std::fs::write(&file, "[]").unwrap();
+        session_start_lines(&db, true);
+        installer_run(&db, "install --set-reply-rules", || std::fs::remove_file(&file).unwrap());
+        let text = session_start_lines(&db, true).join("\n");
+        assert!(text.contains("THOR's setting guard-response-rulebook.json was removed with install --set-reply-rules"), "{text}");
+        assert!(!text.contains("did not ask"), "{text}");
     }
 
     #[test]

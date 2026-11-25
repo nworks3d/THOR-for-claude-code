@@ -502,7 +502,7 @@ Words used once, in plain language:
   `serve ... hook` is refused, also behind `timeout`, `env`, `nice`, `stdbuf`, `time`, `sudo`, `doas`,
   `xargs`, `find -exec`, `bash -c`, `cmd /c`, `Start-Process`, `cargo run -- hook` and
   `[Diagnostics.Process]::Start`, because it would forge a record, unless the run carries `--no-record`,
-  `--diagnose`, `--help` or `--version` (a probe: it writes no owner record, starts no evaluation and
+  `--diagnose`, `--help`/`-h` or `--version`/`-V` (exactly the flags `serve` honours; a probe: it writes no owner record, starts no evaluation and
   moves no setting-file record); `cargo test -p serve hook`, `grep serve hook`
   and `npx serve` are not refused (`serve` is not THOR's program there). A script file, a variable that
   holds the program, and a copy under another name are not seen. An answer that does not name the note
@@ -758,7 +758,10 @@ remembers per session how far it has looked, so a long conversation does not mak
 ### D1. A forbidden fragment in a command
 - What: a rule with a "forbidden" check refuses a command containing its fragment as whole words
   (--force does not match inside --force-with-lease), in any part of the call: after cd, on a later
-  line, inside ssh "...", bash -c, $(...), behind a pipe, past sudo or timeout. Text that only mentions
+  line, inside ssh "...", bash -c, $(...), behind a pipe, past a wrapper (timeout, env with -i and
+  NAME=value, nice, ionice, stdbuf, time, sudo, doas, nohup, exec, setsid, xargs with its options,
+  `find -exec` and `-execdir`: the wrapped command is read as a command of its own, so a requires or
+  owner-approval rule binds to it too). Text that only mentions
   the command (echo, grep, a heredoc, a comment) is not a call.
 - Why: a wrong change that does not land is the whole promise.
 - You notice: the tool call is refused with "[THOR]", the rule id and the fragment.
@@ -1049,7 +1052,13 @@ remembers per session how far it has looked, so a long conversation does not mak
   the file and what changed in it (the changed part and where it starts, secrets blanked), and the
   assistant is told to tell the owner in one sentence unless he asked for it. Every Stop looks too, so a
   change made and put back inside one session is still named at the next session start
-  (`mode-files-pending.json`). The first start only records. Not seen: a file the list does not
+  (`mode-files-pending.json`). A change made with THOR's own installer (`install --set-language`,
+  `--set-mode`, `--set-reply-rules`, `--set-helpers`, any other switch, or a plain install) is recorded
+  by the installer with the hash it wrote (`mode-files-installer.json`) and gets one neutral line
+  instead of the warning: "THOR's setting thor-mode.json was changed with install --set-language (now:
+  ...)". A later hand edit differs from that hash and gets the warning. The line names the switch and
+  does not claim the owner ran it, because an assistant can run the installer too; and a hand edit that
+  writes exactly the bytes the installer wrote reads as the installer's. The first start only records. Not seen: a file the list does not
   name, a judge command that is only a program on the search path.
 - Why: so a guard cannot be switched off by one small edit nobody sees.
 - You notice: a line at the start of a session, or a NOTE in doctor's short summary.

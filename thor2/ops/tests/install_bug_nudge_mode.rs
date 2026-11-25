@@ -56,7 +56,12 @@ fn set_mode_writes_the_mode_and_nothing_else() {
     assert_eq!(read_mode(&db), Some(Mode::Test));
     let mut names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     names.sort();
-    assert_eq!(names, vec!["thor-mode.json".to_string(), "thor.db".to_string()], "no hook, no setting, no other file");
+    // The one extra file is the installer's own note of what it wrote to a watched file (`serve::mode_files`).
+    assert_eq!(
+        names,
+        vec!["mode-files-installer.json".to_string(), "thor-mode.json".to_string(), "thor.db".to_string()],
+        "no hook, no setting, no other file"
+    );
 }
 
 #[test]
