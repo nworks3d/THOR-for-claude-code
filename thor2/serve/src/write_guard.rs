@@ -1739,7 +1739,12 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
         let listing = std::process::Command::new("cmd").args(["/c", &format!("for %I in (\"{}\") do @echo %~sI", tmp.display())]).output();
         let short = listing.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-        if cfg!(windows) && short.contains('~') {
+        // Only when the folder itself got a short name: a temp path such as
+        // C:\Users\RUNNER~1\... already holds a `~` on a volume that makes no
+        // short names, and the listing then echoes its input unresolved.
+        let short_path = std::path::Path::new(&short);
+        let folder_is_short = short_path.file_name().is_some_and(|n| n.to_string_lossy().contains('~'));
+        if cfg!(windows) && folder_is_short && short_path.is_dir() {
             let g = Protected::new(Some(&tmp), None, &[]);
             let input = serde_json::json!({ "command": format!("echo x > {short}\\thor.db") });
             assert!(refusal(&g, "Bash", Some(&input), None).is_some(), "{short}");
