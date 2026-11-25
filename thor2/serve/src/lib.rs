@@ -163,6 +163,7 @@ pub mod stop_budget;
 pub mod crowding_seen;
 pub mod turn_violation;
 pub mod unpin_gate;
+pub mod write_guard;
 pub mod usefulness;
 #[cfg(feature = "semantic")]
 pub mod vectors;

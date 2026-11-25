@@ -66,7 +66,7 @@ pub fn is_gated_call(tool_name: &str) -> bool {
 /// Is this tool name one that can ADD a pin (remember, revise or pin)? Its `because` may quote the
 /// owner's own go for an overflow pin, which the hook witnesses the same way (`witness`).
 pub fn is_pin_call(tool_name: &str) -> bool {
-    ["remember", "revise", "pin"].iter().any(|t| tool_name == *t || tool_name.ends_with(&format!("__{t}")))
+    ["remember", "revise", "pin", "resolve"].iter().any(|t| tool_name == *t || tool_name.ends_with(&format!("__{t}")))
 }
 
 /// Does this binding list carry `Always`?
@@ -121,7 +121,7 @@ pub fn still_in_use(store: &EventStore, item: &Item, root: &Path, now: i64) -> V
 /// The plain refusal for a note that is still in use.
 pub fn in_use_refusal(id: &str, reasons: &[String], quote_unwitnessed: bool, how: Takedown) -> String {
     let unwitnessed = if quote_unwitnessed {
-        " THOR could not confirm that the quoted words are one whole message the owner typed in this session about this \
+        " THOR could not confirm that the quoted words are one whole message the owner typed in one of his last two messages about this \
          note (a piece of it, a message about something else, a helper's text and your own text do not count)."
     } else {
         ""
@@ -220,12 +220,12 @@ pub fn owner_rule_go(
     }
     let quoted = !crate::order_earlier::quote_candidates(given).is_empty();
     let unwitnessed = if quoted {
-        " The words you quoted are not one whole message the owner typed in this session that names this rule (a piece of it, a message about something else, a helper's text and your own text do not count)."
+        " The words you quoted are not one whole message of the last two the owner typed (this turn's or the one before) that names this rule (a piece of it, a message about something else, a helper's text and your own text do not count)."
     } else {
         ""
     };
     Err(format!(
-        "REFUSED: nothing was changed. '{id}' is a rule that needs the owner's explicit go, and this call loosens it: {}.{unwitnessed} Only the owner can loosen such a rule, and THOR accepts it only on his own typed words. Ask the owner whether he wants this (name the rule's id '{id}' in your question). When he has said so in his own message in this session, repeat the call with `{field}` holding his whole message between double quotes.",
+        "REFUSED: nothing was changed. '{id}' is a rule that needs the owner's explicit go, and this call loosens it: {}.{unwitnessed} Only the owner can loosen such a rule, and THOR accepts it only on his own typed words. Ask the owner whether he wants this (name the rule's id '{id}' in your question). When he has said so in one of his last two messages, repeat the call with `{field}` holding his whole message between double quotes.",
         what.join("; ")
     ))
 }
@@ -235,6 +235,9 @@ pub fn owner_rule_go(
 const FOLD_SURVIVOR_MIN_AGE_SECS: i64 = 24 * 3_600;
 /// How recently the survivor's text must have been rewritten for a retract to be its fold.
 const FOLD_REWRITE_WITHIN_SECS: i64 = 3_600;
+
+/// How many characters longer the survivor's text must have become for its rewrite to be a fold.
+const FOLD_MIN_ADDED_CHARS: usize = 20;
 
 /// Does `reason` name `id` as a whole token (not as part of a longer word or id)?
 fn names_as_a_token(reason: &str, id: &str) -> bool {
@@ -288,9 +291,18 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
         let mut rewritten_just_now = false;
         for e in events.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)) {
             let Ok(version) = model::store::parse_body(&e.body) else { continue };
-            let changed = before_text.as_ref().is_some_and(|t| *t != version.text);
+            // A real fold ADDS the point: the text grows by a real margin, and the revise said
+            // why with the retracted note's id (a trivial edit of an old pin is no fold).
+            let grew = before_text
+                .as_ref()
+                .is_some_and(|t| version.text.chars().count() >= t.chars().count() + FOLD_MIN_ADDED_CHARS);
+            let named = serde_json::from_str::<serde_json::Value>(&e.body)
+                .ok()
+                .and_then(|v| v.get("because").and_then(|b| b.as_str()).map(|b| names_as_a_token(b, &item.id)))
+                .unwrap_or(false);
             if e.kind == EventKind::FactRevised
-                && changed
+                && grew
+                && named
                 && e.seq > own_last_write
                 && crate::sweep::time_of_seq(store, e.seq).is_some_and(|at| now - at <= FOLD_REWRITE_WITHIN_SECS && now >= at)
             {
@@ -300,7 +312,8 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
         }
         if !rewritten_just_now {
             missing = Some(format!(
-                "'{id}' was not rewritten in the last 60 minutes, after this note's last change, to carry this point"
+                "'{id}' was not rewritten in the last 60 minutes, after this note's last change, to carry this point (the rewrite must add at least {FOLD_MIN_ADDED_CHARS} characters of text, and its `because` must name '{}')",
+                item.id
             ));
             continue;
         }
@@ -309,30 +322,54 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
     Err(missing)
 }
 
-/// Every message the owner typed in the transcript, each with the text of the
-/// assistant's turn directly before it (empty when there was none).
+/// How many of the owner's last typed messages a quote may come from: this turn's and the
+/// one before, the same window a go-word has.
+pub const OWNER_WINDOW: usize = 2;
+
+/// The owner's LAST `OWNER_WINDOW` typed messages in the transcript, each with the text of the
+/// assistant message directly before it (empty when there was none). Older messages are not
+/// returned: a "yes" from earlier in the session unlocks nothing now. The transcript is read
+/// backwards until those messages are found, however long the turns between them were.
 pub fn owner_pairs(transcript: &Path) -> Vec<(String, String)> {
-    let Ok(text) = std::fs::read_to_string(transcript) else { return Vec::new() };
+    let lines = crate::attest::lines_with_owner_messages(transcript, OWNER_WINDOW + 1);
     let mut out = Vec::new();
+    // The assistant message directly before the next owner message: the text lines of the
+    // latest assistant message (lines that share a message id are one message).
     let mut assistant = String::new();
-    for raw in text.lines() {
+    let mut assistant_id: Option<String> = None;
+    for raw in &lines {
         if let Some(person) = crate::attest::owner_text(raw) {
             out.push((person, std::mem::take(&mut assistant)));
+            assistant_id = None;
             continue;
         }
         let Ok(line) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
         let main_assistant = line.get("type").and_then(|t| t.as_str()) == Some("assistant")
             && line.get("isSidechain").and_then(|b| b.as_bool()) != Some(true);
-        if main_assistant {
-            for block in line.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()).into_iter().flatten() {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    assistant.push_str(block.get("text").and_then(|t| t.as_str()).unwrap_or(""));
-                    assistant.push('\n');
-                }
-            }
+        if !main_assistant {
+            continue;
         }
+        let message = line.get("message");
+        let text: String = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .map(|block| format!("{}\n", block.get("text").and_then(|t| t.as_str()).unwrap_or("")))
+            .collect();
+        if text.is_empty() {
+            continue;
+        }
+        let id = message.and_then(|m| m.get("id")).and_then(|i| i.as_str()).map(str::to_string);
+        if id.is_none() || id != assistant_id {
+            assistant.clear();
+        }
+        assistant.push_str(&text);
+        assistant_id = id;
     }
-    out
+    let skip = out.len().saturating_sub(OWNER_WINDOW);
+    out.split_off(skip)
 }
 
 /// Does `because` quote, between double quotes, one WHOLE message among the
@@ -466,6 +503,54 @@ mod tests {
         // "ok" counts only after a question about THIS note.
         assert!(owner_quote_matches("he said \"ok\"", "pinned-n2", &pairs()));
         assert!(!owner_quote_matches("he said \"ok\"", "pinned-n3", &pairs()), "an ok about another note unlocks nothing");
+    }
+
+    fn user_line(text: &str) -> String {
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}).to_string()
+    }
+
+    fn assistant_line(id: &str, text: &str) -> String {
+        serde_json::json!({"type": "assistant", "message": {"id": id, "content": [{"type": "text", "text": text}]}}).to_string()
+    }
+
+    #[test]
+    fn only_the_last_two_owner_messages_count_and_the_id_must_be_directly_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let lines = [
+            assistant_line("m0", "Shall I unpin note-old?"),
+            user_line("Ja, doe maar, haal die oude notitie weg."),
+            assistant_line("m1", "Done. Anything else?"),
+            user_line("nee"),
+            assistant_line("m2", "Working on it."),
+            user_line("verder"),
+            assistant_line("m3", "Shall I unpin note-new?"),
+            assistant_line("m4", "Also, a long unrelated text that names note-sneaky."),
+            user_line("ja graag, doe dat"),
+        ];
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        let pairs = owner_pairs(&transcript);
+        assert_eq!(pairs.len(), 2, "only the last two owner messages");
+        let old = "he said \"Ja, doe maar, haal die oude notitie weg.\"";
+        assert!(!owner_quote_matches(old, "note-old", &pairs), "an older yes is out of the window");
+        let recent = "he said \"ja graag, doe dat\"";
+        assert!(owner_quote_matches(recent, "note-sneaky", &pairs), "the assistant message directly before names it");
+        assert!(!owner_quote_matches(recent, "note-new", &pairs), "an older assistant message is not directly before");
+    }
+
+    #[test]
+    fn a_go_before_a_huge_turn_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let big = "x".repeat(1024 * 1024);
+        let mut lines = vec![assistant_line("m1", "Shall I unpin note-far?"), user_line("ja, doe maar, haal hem weg")];
+        for n in 0..20 {
+            lines.push(serde_json::json!({"type": "assistant", "message": {"id": format!("t{n}"), "content": [{"type": "tool_use", "name": "Bash", "input": {"command": big}}]}}).to_string());
+        }
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        assert!(std::fs::metadata(&transcript).unwrap().len() > crate::attest::TRANSCRIPT_TAIL_BYTES);
+        let pairs = owner_pairs(&transcript);
+        assert!(owner_quote_matches("he said \"ja, doe maar, haal hem weg\"", "note-far", &pairs));
     }
 
     #[test]

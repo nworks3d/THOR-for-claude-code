@@ -2126,10 +2126,10 @@ fn owner_pin_refusal(id: &str, quoted: &str) -> String {
     let unwitnessed = if serve::order_earlier::quote_candidates(quoted).is_empty() {
         ""
     } else {
-        " The words you quoted are not one whole message the owner typed in this session that names this note (a piece of it, a message about something else, a helper's text and your own text do not count)."
+        " The words you quoted are not one whole message of the last two the owner typed (this turn's or the one before) that names this note (a piece of it, a message about something else, a helper's text and your own text do not count)."
     };
     format!(
-        "REFUSED: nothing was changed. '{id}' would be pinned, which brings it into every conversation, and that start block is the owner's: only he decides what goes in it.{unwitnessed} Ask the owner in one plain sentence whether this has to come along in every conversation (name the note's id '{id}' in your question). When he has said yes in his own message in this session, repeat the call with `because` holding his whole message between double quotes. If it only matters for one subject, leave Always out and bind the note to its project (a binding of kind project) instead."
+        "REFUSED: nothing was changed. '{id}' would be pinned, which brings it into every conversation, and that start block is the owner's: only he decides what goes in it.{unwitnessed} Ask the owner in one plain sentence whether this has to come along in every conversation (name the note's id '{id}' in your question). When he has said yes in one of his last two messages, repeat the call with `because` holding his whole message between double quotes. If it only matters for one subject, leave Always out and bind the note to its project (a binding of kind project) instead."
     )
 }
 
@@ -12058,7 +12058,38 @@ mod tests {
 
         // The survivor is rewritten just now to carry the point; a token that is only a substring of a longer id does not count.
         dated_serving(&srv, &serve::time::now_iso8601());
-        assert!(shorten(&srv, "fold-b", "Sunday dinners start at six, the ferry leaves at nine.").await.starts_with("revised"));
+        // A trivial edit of the survivor (no real text added, no reason naming the note) is no fold.
+        assert!(shorten(&srv, "fold-b", "Sunday dinners start at six!").await.starts_with("revised"));
+        let trivial = try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await;
+        assert!(trivial.starts_with("REFUSED") && trivial.contains("must add at least 20 characters"), "{trivial}");
+        // Adds text but its reason does not name the retracted note: no fold either.
+        let unnamed = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "fold-b".to_string(),
+                    text: Some("Sunday dinners start at six, the ferry leaves at nine, bring a coat.".to_string()),
+                    because: Some("adds the ferry time and the coat".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(unnamed.starts_with("revised"), "{unnamed}");
+        assert!(try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await.starts_with("REFUSED"));
+        let named = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "fold-b".to_string(),
+                    text: Some("Sunday dinners start at six, the ferry leaves at nine, bring a coat and a torch and a spare key.".to_string()),
+                    because: Some("now also carries the point of fold-a, so that one can be folded".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(named.starts_with("revised"), "{named}");
         let substring = try_retract(&srv, "fold-a", "folded into fold-bb, which now carries the point about dinner").await;
         assert!(substring.starts_with("REFUSED"), "fold-b only as a substring of fold-bb is no token: {substring}");
         // The honest fold.

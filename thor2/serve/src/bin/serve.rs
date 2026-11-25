@@ -2836,6 +2836,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input) {
                 return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
             }
+            // The files only Claude Code and THOR write (saved conversations, the memory's folder,
+            // THOR's programs): no call may write to them (`serve::write_guard`).
+            if let Some(reason) = serve::write_guard::refusal(&serve::write_guard::Protected::current(db_path), tool_name, tool_input) {
+                return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
+            }
             if serve::unpin_gate::is_gated_call(tool_name) || serve::unpin_gate::is_pin_call(tool_name) {
                 serve::unpin_gate::witness(db_path, &payload, time::now_unix());
             }
