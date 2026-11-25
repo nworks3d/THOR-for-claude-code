@@ -1462,6 +1462,11 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         serve::volume::record_stop(db_path, &resolve_session_id(p), matches!(out, Some(HookOutput::Decision(_))));
     }
     let Some(payload) = payload.filter(|p| !no_record && !payload_is_from_a_subagent(p)) else { return out };
+    // Every Stop looks at the setting files the owner edits by hand (a few small files): a change put
+    // back before the next session start is still named there (`serve::mode_files`).
+    if event_name == "Stop" {
+        serve::mode_files::note_at_stop(db_path);
+    }
     let session_id = resolve_session_id(&payload);
     match (event_name.as_str(), out) {
         ("Stop", Some(HookOutput::Warn { text })) => {
@@ -2494,6 +2499,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 &session_start::ExtrasFor {
                     source,
                     headless: kind.headless,
+                    attended: kind_is_attended(&kind),
                     subagent: payload_is_from_a_subagent(&payload),
                     record: !no_record,
                     copy,
@@ -2579,8 +2585,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // THOR'S OWN RECORD OF WHAT THE OWNER TYPED (`serve::prompt_record`): every check that
                 // accepts his words quotes this record, not the saved conversation an assistant could
                 // append to. Keyed by the payload's own session id, the one the checks read.
-                let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
-                serve::prompt_record::record(db_path, own_session, prompt_text, time::now_unix());
+                // Only a session a person reads: a headless run (`claude -p`, the SDKs) has no owner
+                // typing, whatever its prompt says.
+                if kind_is_attended(&session_kind(&payload)) {
+                    let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+                    serve::prompt_record::record(db_path, own_session, prompt_text, time::now_unix());
+                }
             }
             if prompt_text.trim().is_empty() {
                 return None;
@@ -4641,6 +4651,12 @@ struct SessionKind {
     entrypoint: String,
     from: &'static str,
     headless: bool,
+}
+
+/// Whether a person reads this session (`session_start::is_attended`), from the environment Claude
+/// Code gave this process.
+fn kind_is_attended(kind: &SessionKind) -> bool {
+    session_start::is_attended(&kind.entrypoint, std::env::var(session_start::ATTENDED_ENV).ok().as_deref())
 }
 
 fn session_kind(payload: &Value) -> SessionKind {

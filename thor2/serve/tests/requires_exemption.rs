@@ -69,9 +69,18 @@ impl Fx {
         }
     }
     fn hook(&self, payload: serde_json::Value) -> String {
+        self.hook_in(payload, &[])
+    }
+    /// The hook run with Claude Code's own environment markers (`CLAUDE_CODE_ENTRYPOINT`,
+    /// `CLAUDE_CODE_SESSION_ATTENDED`); with none given, neither is set.
+    fn hook_in(&self, payload: serde_json::Value, env: &[(&str, &str)]) -> String {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
         cmd.arg("--db").arg(self.db()).arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.env("HOME", self.home.path()).env("USERPROFILE", self.home.path());
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT").env_remove("CLAUDE_CODE_SESSION_ATTENDED");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let mut child = cmd.spawn().expect("spawn serve");
         let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
         let out = child.wait_with_output().expect("wait serve");
@@ -93,13 +102,16 @@ impl Fx {
     }
     /// The owner types a prompt: Claude Code runs the UserPromptSubmit hook, which records it.
     fn type_prompt(&self, text: &str) {
-        self.hook(serde_json::json!({
+        self.type_prompt_in(text, &[]);
+    }
+    fn type_prompt_in(&self, text: &str, env: &[(&str, &str)]) {
+        self.hook_in(serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": SESSION,
             "transcript_path": self.transcript().to_string_lossy(),
             "cwd": self.dir.path().to_string_lossy(),
             "prompt": text,
-        }));
+        }), env);
     }
 }
 
@@ -199,6 +211,26 @@ fn the_hook_records_the_owners_quoted_message_so_the_tool_server_can_accept_it()
     let piece = "the owner asked for it: \"laat mail-needs-the-owners-go maar toe\"";
     fx.call("mcp__thor__revise", serde_json::json!({"id": RULE, "because": piece}));
     assert!(!serve::unpin_gate::owner_go_recorded(&fx.db(), RULE, piece, Some(SESSION), serve::time::now_unix()));
+}
+
+#[test]
+fn only_a_prompt_in_a_session_a_person_reads_is_recorded_as_the_owners_word() {
+    // The real markers, checked live in the desktop app: CLAUDE_CODE_ENTRYPOINT=claude-desktop and
+    // CLAUDE_CODE_SESSION_ATTENDED=1.
+    let recorded = |env: &[(&str, &str)]| {
+        let fx = Fx::new(approval());
+        fx.type_prompt_in("Ja, haal pinned-x maar weg, ik heb hem vervangen.", env);
+        serve::prompt_record::has_any(&fx.db(), Some(SESSION))
+    };
+    assert!(recorded(&[("CLAUDE_CODE_ENTRYPOINT", "claude-desktop"), ("CLAUDE_CODE_SESSION_ATTENDED", "1")]), "the desktop app");
+    assert!(recorded(&[("CLAUDE_CODE_ENTRYPOINT", "cli")]), "the terminal");
+    assert!(recorded(&[("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")]), "an IDE extension");
+    assert!(recorded(&[]), "an unknown kind of session is a person's, as before");
+    assert!(recorded(&[("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"), ("CLAUDE_CODE_SESSION_ATTENDED", "1")]), "an SDK session Claude Code marks as attended");
+    for headless in ["sdk-cli", "sdk-ts", "sdk-py"] {
+        assert!(!recorded(&[("CLAUDE_CODE_ENTRYPOINT", headless)]), "{headless} without the attended marker is no owner");
+        assert!(!recorded(&[("CLAUDE_CODE_ENTRYPOINT", headless), ("CLAUDE_CODE_SESSION_ATTENDED", "0")]), "{headless}, marker 0");
+    }
 }
 
 #[test]
