@@ -998,7 +998,8 @@ fn register_only(db: Option<PathBuf>, per_machine: bool, ask_main: bool) -> Exit
     let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     serve::project::load_known_scopes(&db);
     let existing = serve::project::git_root(&here)
-        .or_else(|| serve::project::plain_root(&here))
+        // A broad folder an earlier install marked is not adopted: topic_of reports it.
+        .or_else(|| serve::project::plain_root(&here).filter(|top| !model::checkout::is_too_broad_folder(top)))
         .and_then(|top| serve::project::resolve_project(&top));
     let key = match existing {
         Some(key) => key,

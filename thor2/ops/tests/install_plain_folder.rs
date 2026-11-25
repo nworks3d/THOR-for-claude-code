@@ -177,6 +177,53 @@ fn the_home_folder_is_refused_as_a_topic() {
     assert_eq!(event_count(&sandbox.db()), events);
 }
 
+/// Documents, Desktop and Downloads are as broad as the home folder: refused
+/// in plain words, with their own name, and nothing is written into them.
+#[test]
+fn documents_desktop_and_downloads_are_refused_as_a_topic() {
+    let sandbox = Sandbox::new();
+    ops::install::ensure_store(&sandbox.db()).unwrap();
+    let events = event_count(&sandbox.db());
+    for (folder, word) in [("Documents", "Documents folder"), ("Desktop", "Desktop folder"), ("Downloads", "Downloads folder")] {
+        let dir = sandbox.home.path().join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        let via_flag = install(&dir, &sandbox, &["--topic"]);
+        assert_eq!(via_flag.status.code(), Some(1), "{folder}: {}", text(&via_flag));
+        assert!(text(&via_flag).contains(&format!("is your {word}, which is too broad to be one topic")), "{}", text(&via_flag));
+        let via_register = register(&dir, &sandbox);
+        assert_eq!(via_register.status.code(), Some(1), "{folder}: {}", text(&via_register));
+        assert!(!dir.join(".thor-project").exists(), "{folder} got a marker");
+    }
+    assert_eq!(event_count(&sandbox.db()), events);
+}
+
+/// A broad folder that an earlier install marked is reported, not adopted, and
+/// the folders inside it can still get a memory of their own.
+#[test]
+fn a_broad_memory_from_an_earlier_install_is_reported_and_its_subfolders_get_their_own() {
+    let sandbox = Sandbox::new();
+    ops::install::ensure_store(&sandbox.db()).unwrap();
+    let documents = sandbox.home.path().join("Documents");
+    std::fs::create_dir_all(&documents).unwrap();
+    std::fs::write(documents.join(".thor-project"), "Documents\n").unwrap();
+
+    let out = install(&documents, &sandbox, &["--topic"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("an earlier install gave it a memory of its own"), "{}", text(&out));
+    assert!(text(&out).contains("It was not taken over"), "{}", text(&out));
+
+    let topic = sandbox.topic("Kitchen renovation");
+    let out = install(&topic, &sandbox, &["--topic"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(topic.join(".thor-project")).unwrap().trim(), "Kitchen renovation");
+    // A folder with no marker of its own, below the broad one, gets its own.
+    let other = documents.join("Taxes");
+    std::fs::create_dir_all(&other).unwrap();
+    let out = install(&other, &sandbox, &["--topic"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(other.join(".thor-project")).unwrap().trim(), "Taxes");
+}
+
 /// A rule whose file check reads a file of the topic is tried in the topic
 /// folder: stored with its check, and a file that lacks the literal is
 /// refused as the check's rot rather than silently skipped.

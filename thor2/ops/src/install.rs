@@ -2111,10 +2111,11 @@ pub enum RegisterOutcome {
 pub enum RegisterRefusal {
     /// The folder is neither inside a git checkout nor a marked topic folder.
     NotACheckout { cwd: String },
-    /// The folder is far too broad to be one topic: the home folder or a
-    /// whole drive. Everything a person ever does there would land in one
-    /// memory.
-    TooBroad { cwd: String },
+    /// The folder is far too broad to be one topic: the home folder, Desktop,
+    /// Documents, Downloads or a whole drive (`what` names which, for the
+    /// person). Everything a person ever does there would land in one memory.
+    /// `has_memory` is true when an earlier install already put a memory there.
+    TooBroad { cwd: String, what: String, has_memory: bool },
     /// The registered folder still exists and is still a checkout of this
     /// project: a second copy.
     StillACheckout { key: String, old: String },
@@ -2135,11 +2136,19 @@ impl std::fmt::Display for RegisterRefusal {
                 "REFUSED: {cwd} is not set up as a topic folder yet. The assistant runs the installer from INSIDE the folder for the topic \
                  with --topic added (no git or code needed). Nothing was changed."
             ),
-            RegisterRefusal::TooBroad { cwd } => write!(
+            RegisterRefusal::TooBroad { cwd, what, has_memory: false } => write!(
                 f,
-                "REFUSED: {cwd} is your whole home folder or a whole drive, which is too broad to be one topic. Make a \
+                "REFUSED: {cwd} is your {what}, which is too broad to be one topic. Make a \
                  folder for just one subject (for example 'Kitchen renovation') and the assistant runs this again \
                  from inside it. Nothing was changed."
+            ),
+            RegisterRefusal::TooBroad { cwd, what, has_memory: true } => write!(
+                f,
+                "REFUSED: {cwd} is your {what}, which is too broad to be one topic, yet an earlier install gave it a \
+                 memory of its own (the hidden file .thor-project in it). It was not taken over. Folders inside it \
+                 can have their own memory: make a folder for just one subject (for example 'Kitchen renovation') \
+                 and the assistant runs this again from inside it. To end the broad memory, remove that hidden file; \
+                 the notes already filed under it stay. Nothing was changed."
             ),
             RegisterRefusal::StillACheckout { key, old } => write!(
                 f,
@@ -2205,11 +2214,19 @@ fn registration_top(cwd: &Path) -> Option<PathBuf> {
 /// the home folder and for a drive root, which are far too broad to be one
 /// topic (everything a person ever does there would share one memory).
 pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
-    let too_broad = || RegisterRefusal::TooBroad { cwd: root_string(dir) };
-    if home_dir().is_some_and(|home| same_root(&root_string(&home), &root_string(dir))) {
-        return Err(too_broad());
+    let too_broad = |has_memory: bool| {
+        let what = match home_dir().and_then(|home| serve::inventory::broad_place(&home, dir)) {
+            Some(what) if what == "drive root" => "whole drive".to_string(),
+            Some(what) if what == "home folder" => "whole home folder".to_string(),
+            Some(what) => format!("{what} folder"),
+            None => "whole home folder or a whole drive".to_string(),
+        };
+        RegisterRefusal::TooBroad { cwd: root_string(dir), what, has_memory }
+    };
+    if home_dir().is_some_and(|home| serve::inventory::broad_place(&home, dir).is_some()) {
+        return Err(too_broad(dir.join(".thor-project").is_file()));
     }
-    dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(too_broad)
+    dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(|| too_broad(false))
 }
 
 /// The topic a plain folder is, or would become: the folder that carries (or
@@ -2219,6 +2236,10 @@ pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
 /// which are far too broad (`ops::install::topic_folder_name`).
 pub fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
     let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
+    // A broad folder that an earlier install marked is reported, never adopted.
+    if model::checkout::is_too_broad_folder(&dir) {
+        topic_folder_name(&dir)?;
+    }
     let key = match serve::project::resolve_project(&dir) {
         Some(key) => key,
         None => topic_folder_name(&dir)?,
