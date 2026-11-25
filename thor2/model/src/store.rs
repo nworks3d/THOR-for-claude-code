@@ -6376,9 +6376,9 @@ fn filing_seq_after(store: &EventStore, id: &str, start: &EvaluationStart) -> Op
 /// evaluating session met inside this window is a call it made while judging
 /// the very rules that refused it: it never proves a tooth.
 pub fn evaluation_open_in_session_at(store: &EventStore, session: &str, seq: i64, at_unix: Option<i64>) -> Option<EvaluationStart> {
-    let events = store.events_of_kinds_in_session(&[EventKind::FactCreated, EventKind::FactRevised], session).ok()?;
-    let starts: Vec<EvaluationStart> =
-        starts_in(&events).into_iter().filter(|s| s.frozen.session == session && s.seq < seq).collect();
+    let index = session_evaluation_index(store, session)?;
+    let events = &index.events;
+    let starts: Vec<EvaluationStart> = index.starts.iter().filter(|s| s.seq < seq).cloned().collect();
     starts.into_iter().rev().find(|start| {
         if at_unix.is_some_and(|at| at - start.frozen.started_unix > EVALUATION_OPEN_HOURS * 3600) {
             return false;
@@ -6393,16 +6393,55 @@ pub fn evaluation_open_in_session_at(store: &EventStore, session: &str, seq: i64
         if voided_before {
             return false;
         }
-        let mut reports: Vec<&str> = events
+        let mut reports: Vec<&str> = index
+            .reports
             .iter()
-            .filter(|e| e.seq > start.seq && e.seq < seq)
-            .filter(|e| parse_body(&e.body).is_ok_and(|item| is_evaluation_report_of(&item, &start.frozen.project)))
-            .map(|e| e.entity_id.as_str())
+            .filter(|(report_seq, _, project)| *report_seq > start.seq && *report_seq < seq && *project == start.frozen.project)
+            .map(|(_, id, _)| id.as_str())
             .collect();
         reports.sort_unstable();
         reports.dedup();
         !reports.into_iter().any(|id| filing_seq_after(store, id, start).is_some_and(|filed| filed < seq))
     })
+}
+
+/// What `evaluation_open_in_session_at` reads of one session, worked out ONCE: the session's
+/// create and revise events, its evaluation start records and which of those events file an
+/// evaluation report. Asked once for every earlier refusal of every rule at the start of a weekly
+/// check, the work cost about 50 ms each time (every body parsed again).
+struct SessionEvaluationIndex {
+    events: Vec<Event>,
+    starts: Vec<EvaluationStart>,
+    /// (seq, entity id, project) of each event that files an evaluation report.
+    reports: Vec<(i64, String, String)>,
+}
+
+type IndexKey = (usize, (i64, i64), String);
+
+thread_local! {
+    /// The last session index built on this thread, valid while the log is unchanged.
+    static SESSION_EVALUATION_INDEX: std::cell::RefCell<Option<(IndexKey, std::rc::Rc<SessionEvaluationIndex>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn session_evaluation_index(store: &EventStore, session: &str) -> Option<std::rc::Rc<SessionEvaluationIndex>> {
+    let key: IndexKey = (store as *const EventStore as usize, store.cache_fingerprint().ok()?, session.to_string());
+    if let Some(hit) = SESSION_EVALUATION_INDEX.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, v)| v.clone())) {
+        return Some(hit);
+    }
+    let events = store.events_of_kinds_in_session(&[EventKind::FactCreated, EventKind::FactRevised], session).ok()?;
+    let starts: Vec<EvaluationStart> = starts_in(&events).into_iter().filter(|s| s.frozen.session == session).collect();
+    let reports = events
+        .iter()
+        .filter_map(|e| {
+            let item = parse_body(&e.body).ok()?;
+            let is_report = item.kind == Kind::Report && item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG);
+            is_report.then(|| (e.seq, e.entity_id.clone(), item.project.clone().unwrap_or_default()))
+        })
+        .collect();
+    let index = std::rc::Rc::new(SessionEvaluationIndex { events, starts, reports });
+    SESSION_EVALUATION_INDEX.with(|c| *c.borrow_mut() = Some((key, index.clone())));
+    Some(index)
 }
 
 fn is_evaluation_report_of(item: &Item, project: &str) -> bool {

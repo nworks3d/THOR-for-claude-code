@@ -220,6 +220,23 @@ pub fn bitten(id: &str, item: &Item, reality: &Reality) -> Option<String> {
     None
 }
 
+/// Whether a rule the trial stored as "wired, not proven" has MEANWHILE been proven by the real
+/// hook refusing a real call under its current check. The label is written when the rule is
+/// written, not when the hook refuses, so it goes stale (49 rules on one real store): readers
+/// (`get`, doctor) ask the refusals on record instead of trusting the stored label.
+pub fn proven_by_refusals_since(store: &EventStore, id: &str, item: &Item) -> bool {
+    item.check.is_some() && bitten(id, item, &reality(store, id, item.check.as_ref())).is_some()
+}
+
+/// `item` as a reader should show it: the wired label becomes the proven one when
+/// `proven_by_refusals_since`.
+pub fn with_current_teeth_label(store: &EventStore, id: &str, item: &mut Item) {
+    if item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG) && proven_by_refusals_since(store, id, item) {
+        item.tags.retain(|t| t != model::store::TEETH_WIRED_TAG);
+        item.tags.push(model::store::TEETH_PROVEN_TAG.to_string());
+    }
+}
+
 /// The commit where `literal` last entered or left `path` in the checkout at
 /// `root` (`git log -S<literal> --format=%h -1 -- <path>`): the literal really
 /// lived in that file, so an absent check naming it is about a real mistake.

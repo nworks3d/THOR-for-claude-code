@@ -3429,6 +3429,20 @@ mod step_26_tests {
         assert!(!says_marker(&owner_text(&closed).unwrap(), "go-owner"), "a real block still hides its text");
     }
 
+    /// Not run by default: times the backwards read on real transcripts
+    /// (THOR_MEASURE_TRANSCRIPTS, paths separated by `;`).
+    #[test]
+    #[ignore]
+    fn measure_the_backwards_read_on_real_transcripts() {
+        for path in std::env::var("THOR_MEASURE_TRANSCRIPTS").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
+            let began = std::time::Instant::now();
+            let lines = lines_with_owner_messages(Path::new(path), 3);
+            let owners = lines.iter().filter(|l| owner_text(l).is_some()).count();
+            let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+            println!("{path}: {} lines, {owners} owner messages, {bytes} bytes read, {:?}", lines.len(), began.elapsed());
+        }
+    }
+
     #[test]
     fn the_owners_words_are_found_behind_a_huge_stretch_of_tool_output() {
         let dir = tempfile::tempdir().unwrap();

@@ -2789,7 +2789,8 @@ fn mark_reply(store: &EventStore, id: &str, noise: bool, place: Option<&str>, pi
     if noise && can_refuse {
         let at = place.map(|p| format!(" at {p}")).unwrap_or_default();
         return format!(
-            "marked noise: {id}{at} - recorded, but this rule's check can refuse, so it is never silenced, at any place; it stays shown"
+            "marked noise: {id}{at} - recorded, but it changes nothing: this rule keeps coming, here and everywhere, because its check can refuse a call, and such a rule is never silenced by noise marks. \
+             If it fires where it does not belong, narrow it with mcp__thor__revise on '{id}' (a narrower check literal or a more specific file, command or tool binding, with `because` saying why, at least 20 characters)"
         );
     }
     if noise {
@@ -3722,7 +3723,9 @@ impl ThorMcpServer {
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
         let session = self.session.session_id.clone();
         self.blocking(move |s| match model::store::show(s, &args.id) {
-            Ok(item) => {
+            Ok(mut item) => {
+                // The stored teeth label can be older than the refusals on record.
+                serve::prove::with_current_teeth_label(s, &args.id, &mut item);
                 let shown = serde_json::to_string_pretty(&item).map_err(|e| format!("could not render item: {e}"))?;
                 match args.fired {
                     Some(true) => Ok(format!("{shown}\n\n{}", recent_firings(s, &item.id, session.as_deref()))),
@@ -6379,6 +6382,9 @@ mod tests {
                 "git push --force origin main",
             );
         }
+        // Read BEFORE any rewrite: the stored label still says wired, `get` says what the log holds now.
+        let shown = srv.get(Parameters(GetArgs { id: "real-1".to_string(), fired: None })).await;
+        assert!(shown.contains("teeth:proven-guard") && !shown.contains("teeth:wired-not-proven"), "{shown}");
         let mut args = bare_revise("real-1");
         args.text = Some("never force-push with --force, on any branch".to_string());
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
@@ -9125,7 +9131,7 @@ mod tests {
 
         // Unchecked: the hook never saw it.
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("overflow-1", &text, Some(&quote)))).await;
-        assert!(reply.starts_with("REFUSED") && reply.contains("not one whole message the owner typed"), "an unwitnessed quote is only text: {reply}");
+        assert!(reply.starts_with("REFUSED") && reply.contains("not one whole message of the last two the owner typed"), "an unwitnessed quote is only text: {reply}");
         // A piece of his message is not his message.
         let piece = "the owner said yes: \"Ja, zet overflow-1 maar vast\"";
         witness(piece);

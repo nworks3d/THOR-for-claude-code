@@ -2847,7 +2847,8 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                 blocked.entry(blocker.to_string()).or_default().push(li.id.clone());
             }
             model::store::Settlement::Settled(model::store::Settled::Rule { proven }) => {
-                if proven {
+                // The trial's label is written with the rule: a real refusal since then proves it.
+                if proven || (refused_ids.contains(li.id.as_str()) && serve::prove::proven_by_refusals_since(&store, &li.id, &li.item)) {
                     proven_n += 1;
                 } else {
                     wired_n += 1;
