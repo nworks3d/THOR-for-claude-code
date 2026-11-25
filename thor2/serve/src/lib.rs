@@ -100,6 +100,7 @@
 //! moves or writes inside the owner's folders.
 
 pub mod absent_guard;
+pub mod ask_cache;
 pub mod attest;
 pub mod audit;
 pub mod bug_report;

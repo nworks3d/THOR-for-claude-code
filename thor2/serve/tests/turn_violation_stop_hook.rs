@@ -167,6 +167,48 @@ fn a_violation_that_stays_holds_twice_then_only_a_line_never_a_third_hold() {
     assert!(stood.iter().any(|e| e.entity_id == wanted), "the stand-aside must be on record");
 }
 
+/// The hold text promises a second look at the end of the next turn: it comes also when that
+/// turn only talks (no command, no snapshot), says it is the last hold, and the third turn gets
+/// the one closing line.
+#[test]
+fn the_promised_second_look_comes_also_in_a_turn_that_runs_no_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, work) = fixture(dir.path());
+    begin(&db, "s1", &work);
+    std::fs::write(work.join(FILE), BROKEN).unwrap();
+    let first = blocked(&run_hook(&db, &stop("s1", &work))).expect("first hold");
+    assert!(first.contains("checks again at the end of the next turn"), "{first}");
+
+    run_hook(&db, &prompt("s1", &work)); // next turn: only talking, no tool call
+    let second = blocked(&run_hook(&db, &stop("s1", &work))).expect("the second look must come in a turn with no command");
+    assert!(second.contains(RULE) && !second.contains("checks again"), "the last hold says so: {second}");
+    assert!(second.contains("no more after this one"), "{second}");
+
+    run_hook(&db, &prompt("s1", &work));
+    let third = run_hook(&db, &stop("s1", &work));
+    assert!(blocked(&third).is_none() && third.contains("will not hold the turn again"), "{third}");
+
+    run_hook(&db, &prompt("s1", &work));
+    let fourth = run_hook(&db, &stop("s1", &work));
+    assert!(blocked(&fourth).is_none() && !fourth.contains("will not hold"), "said once: {fourth}");
+}
+
+#[test]
+fn a_violation_put_right_ends_the_second_look() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, work) = fixture(dir.path());
+    begin(&db, "s1", &work);
+    std::fs::write(work.join(FILE), BROKEN).unwrap();
+    assert!(blocked(&run_hook(&db, &stop("s1", &work))).is_some());
+    std::fs::write(work.join(FILE), CLEAN).unwrap();
+    run_hook(&db, &prompt("s1", &work));
+    let out = run_hook(&db, &stop("s1", &work));
+    assert!(blocked(&out).is_none() && !out.contains("will not hold"), "{out}");
+    run_hook(&db, &prompt("s1", &work));
+    std::fs::write(work.join(FILE), BROKEN).unwrap(); // broken again, by no announced route
+    assert!(blocked(&run_hook(&db, &stop("s1", &work))).is_none(), "an unannounced change in a no-command turn is nobody's: put right means closed");
+}
+
 #[test]
 fn a_check_that_already_failed_before_the_turn_is_not_held_by_this_guard() {
     let dir = tempfile::tempdir().unwrap();

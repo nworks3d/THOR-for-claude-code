@@ -4379,6 +4379,7 @@ fn eval_stop_ask(
                     elsewhere.get_or_insert_with(|| serve::holder::holder_line(&project, &session, idle_minutes, why));
                     continue;
                 }
+                let tip_before_ask = store.cache_fingerprint().ok();
                 let reason = evaluation_ask(store, db_path, &project, &clock, at.folder, session_id);
                 usefulness::record_eval_debt_asked(db_path, Some(&project), now);
                 // The ask is where this evaluation starts: one start record
@@ -4424,6 +4425,11 @@ fn eval_stop_ask(
                         Err(serve::eval_session::StartRefused::Store) => None,
                     },
                 };
+                // The start wrote its own records: the ask's slow readings stay valid for the
+                // next Stop of this held turn (`serve::ask_cache`).
+                if let Some(started) = &started {
+                    serve::ask_cache::carry_over(db_path, &project, session_id, now, tip_before_ask, &started.start.id);
+                }
                 if !no_record {
                     serve::holder::claim(db_path, &project, session_id, now);
                 }
@@ -4517,7 +4523,24 @@ fn evaluation_ask(
     let accrued_minutes = work.accrued_secs / 60;
     let own_minutes = clock.own_minutes;
     let state = usefulness::project_eval_state(db_path, current_project);
-    let owed_words = verdict_list_words(store, project, session_id);
+    // THE RHYTHM (part G): one evaluation per week per project, daily on Max
+    // while rot is found. The ask says which applies, in one plain line.
+    let cadence = usefulness::cadence_in(db_path);
+    // The two slow readings (what the verdict list will hold, and why the rhythm is daily) are
+    // kept while the log has not moved, so a turn held again at the next Stop does not pay for
+    // them again (`serve::ask_cache`).
+    let open_start = model::store::open_evaluation_start_at(store, session_id, project, now).map(|s| s.id);
+    let (owed_words, rot_reason) = serve::ask_cache::readings(
+        db_path,
+        store,
+        project,
+        session_id,
+        now,
+        open_start.as_deref(),
+        cadence == usefulness::EvalCadence::WeeklyUnlessRot,
+        || verdict_list_words(store, project, session_id),
+        || serve::eval_filing::project_rot(store, project),
+    );
     // THE ASK FOLLOWS THE WORK (D11): named when the folder is elsewhere.
     let elsewhere = match folder_project {
         Some(folder) if folder == project => String::new(),
@@ -4569,10 +4592,6 @@ fn evaluation_ask(
         false => String::new(),
     };
 
-    // THE RHYTHM (part G): one evaluation per week per project, daily on Max
-    // while rot is found. The ask says which applies, in one plain line.
-    let cadence = usefulness::cadence_in(db_path);
-    let rot_reason = (cadence == usefulness::EvalCadence::WeeklyUnlessRot).then(|| serve::eval_filing::project_rot(store, project)).flatten();
     let rot = rot_reason.is_some();
     let mode = usefulness::mode_line_why(cadence, rot_reason.as_deref());
     let quiet_days = usefulness::covers_hours(cadence, rot) / 24;
@@ -5095,7 +5114,8 @@ fn turn_violation_stop_check(
     session_project: Option<&str>,
 ) -> serve::turn_violation::Found {
     // A turn that ran no shell command has no snapshot: nothing is read or checked.
-    if !serve::turn_violation::has_snapshot(db_path, session_id) {
+    // A violation held at an earlier Stop is asked about again at the next one, snapshot or not.
+    if !serve::turn_violation::has_snapshot(db_path, session_id) && !serve::turn_violation::has_open_violation(db_path, session_id) {
         return Default::default();
     }
     let Ok(store) = serve::store_dir::open_existing(db_path) else { return Default::default() };

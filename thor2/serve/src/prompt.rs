@@ -33,11 +33,38 @@ use model::normalize::{last_segment, normalize_target};
 /// `normalize::last_segment` doctrine used everywhere else in this
 /// workspace), so a prompt naming the target by its full path ("src/main.rs")
 /// still resolves a binding declared by bare name alone ("main.rs").
-fn contains_word(haystack_normalized: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
+fn contains_word(words: &PromptWords, needle: &str) -> bool {
+    !needle.is_empty() && words.at.contains_key(needle)
+}
+
+/// A prompt cut into its tokens ONCE, however many anchors are then asked about it. Cutting it
+/// again for every anchor cost 0.1 ms per character of the prompt: a 200,000 character prompt
+/// of non-ASCII text (every character a break) took 10 to 14 seconds, against 2 for the same
+/// length of plain text.
+struct PromptWords<'a> {
+    normalized: &'a str,
+    /// The last segment of every non-empty token, in the order of the prompt.
+    segments: Vec<&'a str>,
+    /// Where in `segments` each last segment occurs.
+    at: std::collections::HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'a> PromptWords<'a> {
+    fn new(normalized: &'a str) -> Self {
+        let segments: Vec<&str> = normalized.split(is_break).filter(|t| !t.is_empty()).map(last_segment).collect();
+        let mut at: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+        for (i, segment) in segments.iter().enumerate() {
+            at.entry(segment).or_default().push(i);
+        }
+        PromptWords { normalized, segments, at }
     }
-    haystack_normalized.split(is_break).any(|token| last_segment(token) == needle)
+
+    /// Whether the words of `needle` (non-empty) follow each other in the prompt, in order.
+    fn has_run(&self, needle: &[&str]) -> bool {
+        let wanted: Vec<&str> = needle.iter().map(|w| last_segment(w)).collect();
+        let Some(starts) = wanted.first().and_then(|first| self.at.get(first)) else { return false };
+        starts.iter().any(|&start| self.segments.get(start..start + wanted.len()).is_some_and(|window| window == wanted.as_slice()))
+    }
 }
 
 /// The one place this file decides where a token ends, so the prompt and the
@@ -63,22 +90,16 @@ fn is_break(c: char) -> bool {
 /// A single-word needle takes the old path unchanged, so nothing that resolved
 /// before can resolve differently now - the only outcomes this adds are matches
 /// where there were none.
-fn contains_phrase(haystack_normalized: &str, needle: &str) -> bool {
+fn contains_phrase(words: &PromptWords, needle: &str) -> bool {
     let needle_tokens: Vec<&str> = needle.split(is_break).filter(|t| !t.is_empty()).collect();
     match needle_tokens.len() {
         0 => false,
-        1 => contains_word(haystack_normalized, needle_tokens[0]),
-        n => {
-            let hay: Vec<&str> =
-                haystack_normalized.split(is_break).filter(|t| !t.is_empty()).collect();
-            // Consecutive, in order: "aluminium 6061" is named by "voor aluminium
-            // 6061 geldt", never by "aluminium is niet 6061". A bag of words here
-            // would fire on any prompt that happens to use both, which is exactly
-            // the widening this workspace refuses.
-            hay.windows(n).any(|window| {
-                window.iter().zip(&needle_tokens).all(|(t, w)| last_segment(t) == last_segment(w))
-            })
-        }
+        1 => contains_word(words, needle_tokens[0]),
+        // Consecutive, in order: "aluminium 6061" is named by "voor aluminium
+        // 6061 geldt", never by "aluminium is niet 6061". A bag of words here
+        // would fire on any prompt that happens to use both, which is exactly
+        // the widening this workspace refuses.
+        _ => words.has_run(&needle_tokens),
     }
 }
 
@@ -127,15 +148,15 @@ fn names_full_path(haystack_normalized: &str, anchor_normalized: &str) -> bool {
 /// last segment as a word (`contains_phrase`); a path, directory or route
 /// anchor the same way unless that segment is a bare generic word, which only
 /// its path (`site/dev`) names.
-fn names_target(prompt_normalized: &str, kind: model::item::TargetKind, value: &str) -> bool {
+fn names_target(words: &PromptWords, kind: model::item::TargetKind, value: &str) -> bool {
     use model::item::TargetKind;
     let anchor = normalize_target(value);
     let segment = last_segment(&anchor);
     match kind {
         TargetKind::Path | TargetKind::Dir | TargetKind::Route if is_generic_segment(segment) => {
-            names_full_path(prompt_normalized, &anchor)
+            names_full_path(words.normalized, &anchor)
         }
-        _ => contains_phrase(prompt_normalized, segment),
+        _ => contains_phrase(words, segment),
     }
 }
 
@@ -248,10 +269,11 @@ pub fn resolve(prompt: &str, candidates: &[LiveItem]) -> ServeInput {
     }
 
     let normalized_prompt = normalize_target(prompt);
+    let words = PromptWords::new(&normalized_prompt);
     for c in candidates {
         for binding in &c.item.bindings {
             if let Binding::Target { kind, value } = binding {
-                if names_target(&normalized_prompt, *kind, value) {
+                if names_target(&words, *kind, value) {
                     let entry = (*kind, value.clone());
                     if !input.targets.contains(&entry) {
                         input.targets.push(entry);
@@ -318,6 +340,23 @@ mod tests {
         let items = vec![target_item("bestand", TargetKind::Path, "src/main.rs")];
         assert_eq!(resolve("kijk eens in main.rs", &items).targets.len(), 1);
         assert!(resolve("dit gaat over personas", &items).targets.is_empty());
+    }
+
+    /// A prompt is cut into words once, not once per anchor: 200,000 characters of text that is
+    /// all breaks, against thousands of multi-word anchors, took 10 to 14 seconds in a release
+    /// build. Here the same size must resolve within seconds even unoptimised, and the anchors
+    /// still resolve where the prompt names them.
+    #[test]
+    fn a_huge_non_ascii_prompt_resolves_in_linear_time() {
+        let items: Vec<LiveItem> = (0..3000)
+            .map(|i| target_item(&format!("legering-{i}"), TargetKind::Command, &format!("aluminium {i}")))
+            .collect();
+        let mut prompt = "\u{20ac}".repeat(200_000);
+        prompt.push_str(" welke boutmaat voor aluminium 2999 geldt");
+        let started = std::time::Instant::now();
+        let input = resolve(&prompt, &items);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(input.targets.len(), 1, "only the anchor the prompt names");
     }
 
     #[test]
