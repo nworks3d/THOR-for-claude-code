@@ -4688,8 +4688,37 @@ impl ThorMcpServer {
     }
 }
 
+/// Whether a tool's answer is a refusal: the write gate's `REFUSED: ...` and the
+/// retract tool's `refused: ...`. Such an answer is a failed call, and the client
+/// is told so (`isError`), so one that looks only at that flag never reads a
+/// refusal as a success. Nothing in THOR reads that flag back as a reason to
+/// doubt a write: `serve::attest` and the copy attestation look for a result that
+/// is NOT an error and names `event seq N` (or a queued capture), and a refusal
+/// holds neither.
+pub fn is_refusal_text(text: &str) -> bool {
+    text.starts_with("REFUSED") || text.starts_with("refused:")
+}
+
+/// `result` with `isError` set when its first text is a refusal.
+fn flag_a_refusal(mut result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
+    let refused = result.content.first().and_then(|c| c.as_text()).is_some_and(|t| is_refusal_text(&t.text));
+    if refused {
+        result.is_error = Some(true);
+    }
+    result
+}
+
 #[tool_handler]
 impl ServerHandler for ThorMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await.map(flag_a_refusal)
+    }
+
     /// THE GAP THIS CLOSES: `ServerInfo::new` alone leaves `server_info` at
     /// rmcp's own `Implementation::from_build_env()` default, which expands
     /// `env!("CARGO_PKG_VERSION")` (and `CARGO_CRATE_NAME`) INSIDE RMCP'S OWN

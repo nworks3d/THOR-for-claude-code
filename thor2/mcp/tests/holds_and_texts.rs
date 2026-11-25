@@ -78,6 +78,26 @@ fn a_memory_file_that_cannot_be_written_says_so_plainly() {
     assert!(!reply.contains("store error"), "{reply}");
 }
 
+/// A refused write is a failed call to the client (`isError`); a stored one is not.
+#[test]
+fn a_refusal_sets_is_error_and_a_stored_note_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path(), &["demo"]);
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join(".thor-project"), "demo\n").unwrap();
+    let mut mcp = Mcp::start(&db, &work);
+    let stored = mcp.call_result("remember", orientation("fine", "demo"));
+    assert!(stored["content"][0]["text"].as_str().unwrap().starts_with("stored"), "{stored}");
+    assert_ne!(stored["isError"], json!(true), "a stored note is no error: {stored}");
+    let refused = mcp.call_result("remember", rule("bad", "A rule with no way to fire.", Some("demo")));
+    assert!(refused["content"][0]["text"].as_str().unwrap().starts_with("REFUSED"), "{refused}");
+    assert_eq!(refused["isError"], json!(true), "a refusal is an error to the client: {refused}");
+    let retract = mcp.call_result("retract", json!({"id": "no-such-note", "reason": "this note never existed at all"}));
+    let text = retract["content"][0]["text"].as_str().unwrap().to_lowercase();
+    assert_eq!(retract["isError"], json!(text.starts_with("refused")), "{retract}");
+}
+
 /// A file in the project's own top folder can be anchored by its bare name, and
 /// the note then comes back on an Edit however the call spells the path.
 #[test]

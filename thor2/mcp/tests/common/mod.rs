@@ -101,6 +101,12 @@ impl Mcp {
         self.call_params(serde_json::json!({"name": tool, "arguments": args}))
     }
 
+    /// A tool call's whole `result` object (`content`, `isError`), as the client reads it.
+    pub fn call_result(&mut self, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let v = self.request("tools/call", serde_json::json!({"name": tool, "arguments": args}));
+        v["result"].clone()
+    }
+
     /// `call`, with the `_meta` Claude Code sends: the calling tool_use id.
     pub fn call_meta(&mut self, tool: &str, args: serde_json::Value, tool_use_id: &str) -> String {
         self.call_params(serde_json::json!({
