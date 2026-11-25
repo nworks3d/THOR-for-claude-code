@@ -5661,8 +5661,9 @@ mod crowding_debt_tests {
 
         let asked = crowding_debt(&store, &db, "now", None).expect("a crowded write must hold the turn");
         assert!(asked.contains("mine"), "{asked}");
-        assert!(asked.contains("FOLD"), "it must say what to do, not just that something is wrong: {asked}");
-        assert!(asked.contains("never do is raise its severity"), "{asked}");
+        assert!(asked.contains("(2) fold it"), "it must say what to do, not just that something is wrong: {asked}");
+        assert!(asked.contains("holder-0"), "it names the notes on the place: {asked}");
+        assert!(asked.chars().count() <= 700, "it stays short: {} chars", asked.chars().count());
     }
 
     /// Measured 2026-10-01: the install ran `serve retest --all --apply` from
@@ -5906,12 +5907,8 @@ mod crowding_debt_tests {
 
         let message = crowding_debt(&store, &db, "now", None).expect("fixture sanity");
         assert!(
-            message.contains("REFUSE a write"),
+            message.contains("only if all of them are rules that can refuse a call"),
             "exit 3 must name the condition that makes it honest"
-        );
-        assert!(
-            message.contains("archive a description"),
-            "and must say what to do when the seats are held by descriptions instead"
         );
         assert!(
             !message.contains("full of heavier things"),
@@ -5933,10 +5930,10 @@ mod crowding_debt_tests {
         model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
 
         let message = crowding_debt(&store, &db, "now", None).expect("fixture sanity");
-        assert!(message.contains("BARE"), "the message must say the tag takes no reason");
+        // The exact call is given with the tag written out whole, so there is no way to append a reason to it.
         assert!(
-            message.contains("no-literal"),
-            "and must name the neighbouring exit it is the opposite of"
+            message.contains("tags: [its tags plus 'crowded-on-purpose']"),
+            "the message must give the tag exactly as it counts: {message}"
         );
     }
 
@@ -6040,7 +6037,7 @@ mod crowding_debt_tests {
         assert!(crowding_debt(&store, &db, "now", None).is_none());
         model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
         let asked = crowding_debt(&store, &db, "now", None).expect("the new crowded note holds the turn");
-        assert!(asked.contains("mine") && asked.contains("FOLD"), "{asked}");
+        assert!(asked.contains("mine") && asked.contains("(2) fold it"), "{asked}");
     }
 
     /// A debt found at one Stop keeps holding at the next, with nothing new in

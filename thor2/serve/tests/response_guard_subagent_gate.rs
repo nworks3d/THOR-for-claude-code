@@ -348,7 +348,7 @@ fn the_owners_own_main_session_still_gets_the_crowding_debt() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("mine"), "must name the crowded item: {reason}");
-    assert!(reason.contains("FOLD"), "must be the crowding debt's own message: {reason}");
+    assert!(reason.contains("(2) fold it"), "must be the crowding debt's own message: {reason}");
 }
 
 fn declare_watched_rule(store: &mut thor_core::event_store::EventStore, id: &str) {

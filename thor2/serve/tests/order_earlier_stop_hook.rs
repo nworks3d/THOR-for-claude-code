@@ -173,7 +173,7 @@ fn the_hold_appears_after_the_setup_note_is_retracted_and_not_before() {
     assert!(reason.contains("numbered list"), "it says how the proposal is shown: {reason}");
     let line = held["systemMessage"].as_str().unwrap();
     assert!(line.contains("one last setup step") && line.contains("earlier work in order"), "{line}");
-    assert!(line.contains("Nothing else is needed from you"), "{line}");
+    assert!(line.contains("nothing is needed from you"), "{line}");
 }
 
 #[test]
