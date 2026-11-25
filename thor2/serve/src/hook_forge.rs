@@ -10,6 +10,12 @@
 //! `nohup`, `exec`, `xargs` and `find -exec`, and `[Diagnostics.Process]::Start`, with or without
 //! `.exe`, a folder in front, quotes or escapes inside the words).
 //!
+//! A hand run with `--no-record` (writes nothing at all), `--diagnose` (a probe: it never writes the
+//! owner's prompt record, starts an evaluation or moves the setting-file record), `--help` or
+//! `--version` is not refused. A hand run without one of them is, whatever event its payload holds:
+//! the payload comes from a file or a pipe and is not seen here, and only the typed-prompt event
+//! writes the owner's record.
+//!
 //! The program that runs has to be THOR's `serve` itself: `serve` as a cargo package name
 //! (`cargo test -p serve hook`), a search word (`grep serve hook`) or another program's name
 //! (`npx serve`) is not it, and is never refused.
@@ -51,6 +57,17 @@ fn subcommand_of(words: &[String]) -> Option<String> {
     None
 }
 
+/// Flags that make a hand run of the hook a probe that writes nothing that counts as evidence:
+/// `--no-record` (writes nothing at all), `--diagnose` (never writes the owner's prompt record, an
+/// evaluation start or a move of the setting-file record), and the calls that only ask for help or the
+/// version (AGENTS.md: such a call is never refused).
+const PROBE_FLAGS: [&str; 6] = ["--no-record", "--diagnose", "--help", "-h", "--version", "-v"];
+
+/// Does a word among these carry one of the probe flags (the words may hold several arguments)?
+fn is_a_probe(words: &[String]) -> bool {
+    words.iter().flat_map(|w| w.split_whitespace()).any(|w| PROBE_FLAGS.contains(&bare(w).as_str()))
+}
+
 /// Programs that only carry another program and its words along: what stands between them and the
 /// program they run is flags, their values, numbers (a time limit, a niceness) and `NAME=value`.
 const WRAPPERS: [&str; 22] = [
@@ -80,7 +97,10 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
     let joined = words.join(" ");
     if joined.to_ascii_lowercase().contains("process]::start") {
         let toks = tokens(&joined);
-        if toks.iter().any(|t| t == "serve" || t == "serve.exe") && toks.iter().any(|t| t == "hook") {
+        if toks.iter().any(|t| t == "serve" || t == "serve.exe")
+            && toks.iter().any(|t| t == "hook")
+            && !toks.iter().any(|t| PROBE_FLAGS.contains(&t.as_str()))
+        {
             return true;
         }
     }
@@ -96,7 +116,7 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
             // from standard input, so a missing or unreadable one counts.
             let sub = subcommand_of(rest);
             return match sub.as_deref() {
-                Some("hook") => true,
+                Some("hook") => !is_a_probe(rest),
                 Some(s) => via_xargs && (s.starts_with('{') || s.starts_with('$') || s.starts_with('%')),
                 None => via_xargs,
             };
@@ -108,6 +128,7 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
                     matches!(rest[j].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
                         && rest.get(j + 1).is_some_and(|p| is_serve(p))
                         && subcommand_of(&rest[j + 2..]).as_deref() == Some("hook")
+                        && !is_a_probe(&rest[j + 2..])
                 });
             }
             "cargo" => {
@@ -118,7 +139,7 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
                 let names_serve = rest.iter().take(dashes.unwrap_or(rest.len())).any(|w| is_serve(w));
                 return runs
                     && names_serve
-                    && dashes.is_some_and(|d| subcommand_of(&rest[d + 1..]).as_deref() == Some("hook"));
+                    && dashes.is_some_and(|d| subcommand_of(&rest[d + 1..]).as_deref() == Some("hook") && !is_a_probe(&rest[d + 1..]));
             }
             _ => {}
         }
@@ -196,6 +217,8 @@ mod tests {
             "Start-Process serve.exe -ArgumentList hook",
             "Start-Process serve.exe -ArgumentList '--db a hook'",
             "cargo run --bin serve -- hook",
+            "serve.exe --db x hook --actor probe",
+            "serve.exe hook < payload.json",
             "cargo run -p serve --release -- --db x hook",
             "timeout 5 serve.exe --db x hook",
             "timeout -s KILL 5s serve --db x hook",
@@ -235,6 +258,18 @@ mod tests {
             "cargo run --bin serve -- status",
             "ls thor2/serve/src/hook_forge.rs",
             "python - <<'EOF'\n# serve hook\nEOF",
+            // A probe writes nothing that counts as evidence; a call that only asks for help or the version
+            // is never refused.
+            "serve.exe hook --help",
+            "serve.exe --db x hook --help",
+            "serve hook --version",
+            "serve.exe --db x hook --no-record",
+            "echo {} | serve.exe --db x hook --diagnose",
+            "serve.exe --db x hook --no-record --actor probe",
+            "timeout 5 serve.exe --db x hook --no-record",
+            "find . -exec serve.exe --db x hook --diagnose {} \\;",
+            "cargo run --bin serve -- hook --no-record",
+            "[Diagnostics.Process]::Start('serve.exe', '--db x hook --no-record')",
             // `serve` is a package name, a test filter or a search word, not THOR's program.
             "cargo test -p serve hook",
             "cargo test --release --features semantic -p serve -- hook",

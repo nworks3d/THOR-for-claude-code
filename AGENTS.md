@@ -647,7 +647,8 @@ announce themselves.
   session a person reads records (the desktop app, the terminal, the IDE extensions; not `claude -p`
   or the SDKs unless `CLAUDE_CODE_SESSION_ATTENDED=1`; a child with a forged environment is not seen).
   A shell command that runs THOR's `serve` with the `hook` subcommand is refused, also behind
-  `timeout`, `env`, `xargs`, `find -exec`, `sudo` and the like (it would forge a record); a script
+  `timeout`, `env`, `xargs`, `find -exec`, `sudo` and the like (it would forge a record), unless the
+  run is a probe (`--no-record`, `--diagnose`, `--help`, `--version`), which writes none; a script
   file that does it is not seen. An answer that does not name the note counts only after a question
   about exactly that note (the id and an unpin, retract, remove or loosen verb in the question
   sentence) and only when it is no refusal ("nee", "no", "not", "first").

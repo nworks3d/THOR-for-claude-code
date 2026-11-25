@@ -501,7 +501,9 @@ Words used once, in plain language:
   process an assistant starts with a forged environment is not seen. A shell command that runs THOR's
   `serve ... hook` is refused, also behind `timeout`, `env`, `nice`, `stdbuf`, `time`, `sudo`, `doas`,
   `xargs`, `find -exec`, `bash -c`, `cmd /c`, `Start-Process`, `cargo run -- hook` and
-  `[Diagnostics.Process]::Start`, because it would forge a record; `cargo test -p serve hook`, `grep serve hook`
+  `[Diagnostics.Process]::Start`, because it would forge a record, unless the run carries `--no-record`,
+  `--diagnose`, `--help` or `--version` (a probe: it writes no owner record, starts no evaluation and
+  moves no setting-file record); `cargo test -p serve hook`, `grep serve hook`
   and `npx serve` are not refused (`serve` is not THOR's program there). A script file, a variable that
   holds the program, and a copy under another name are not seen. An answer that does not name the note
   counts only after an assistant question about exactly that one note: the sentence with the question
