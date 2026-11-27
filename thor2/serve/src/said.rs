@@ -114,18 +114,86 @@ fn tidy(text: &str) -> String {
     format!("{cut}...")
 }
 
-/// The first working folder a transcript names, read from its first lines only
-/// (a transcript can be large, and most belong to other projects).
-fn cwd_of(file: &Path) -> std::io::Result<Option<String>> {
+/// The working folders the first lines of a transcript name.
+fn head_cwds(file: &Path) -> std::io::Result<Vec<String>> {
     use std::io::BufRead;
     let reader = std::io::BufReader::new(std::fs::File::open(file)?);
+    let mut out: Vec<String> = Vec::new();
     for line in reader.split(b'\n').take(200) {
         let line = line?;
         if let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&line).ok().and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string)) {
-            return Ok(Some(cwd));
+            if !out.contains(&cwd) {
+                out.push(cwd);
+            }
         }
     }
-    Ok(None)
+    Ok(out)
+}
+
+/// The working folders the last `attest::TRANSCRIPT_TAIL_BYTES` of a
+/// transcript name, found by their bytes (`"cwd"`, a colon, a string) so a tail
+/// of megabytes is never parsed line by line.
+fn tail_cwds(file: &Path) -> std::io::Result<Vec<String>> {
+    let mut handle = std::fs::File::open(file)?;
+    let len = handle.metadata()?.len();
+    let span = len.min(crate::attest::TRANSCRIPT_TAIL_BYTES);
+    handle.seek(SeekFrom::Start(len - span))?;
+    let mut bytes = Vec::with_capacity(span as usize);
+    handle.take(span).read_to_end(&mut bytes)?;
+    let skip_space = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut raw_seen: Vec<&[u8]> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for at in memchr::memmem::find_iter(&bytes, b"\"cwd\"") {
+        let colon = skip_space(at + 5);
+        if bytes.get(colon) != Some(&b':') {
+            continue;
+        }
+        let open = skip_space(colon + 1);
+        if bytes.get(open) != Some(&b'"') {
+            continue;
+        }
+        let mut end = open + 1;
+        while end < bytes.len() && bytes[end] != b'"' {
+            end += if bytes[end] == b'\\' { 2 } else { 1 };
+        }
+        let Some(raw) = bytes.get(open..=end) else { break };
+        if raw_seen.contains(&raw) {
+            continue;
+        }
+        raw_seen.push(raw);
+        if let Ok(cwd) = serde_json::from_slice::<String>(raw) {
+            if !out.contains(&cwd) {
+                out.push(cwd);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the transcript `file` is a session of `project`: a working folder
+/// named in its first lines resolves to it, or else one named in its tail -
+/// the same tail the work clock reads, so the list follows the work as the
+/// ask does. A conversation that began in a folder of no project (the desktop
+/// app's temporary one) and moved to a project later names that project only
+/// further on: measured 2026-11-27, none of 228 messages of such a session
+/// reached its project's list while the first folder alone decided.
+fn session_of(file: &Path, project: &str, resolved: &mut HashMap<String, bool>) -> std::io::Result<bool> {
+    let mut ours = |cwds: Vec<String>| {
+        cwds.into_iter().any(|cwd| {
+            *resolved.entry(cwd.clone()).or_insert_with(|| {
+                crate::project::resolve_project(Path::new(&cwd)).is_some_and(|p| crate::project::same_project_name(&p, project))
+            })
+        })
+    };
+    if ours(head_cwds(file)?) {
+        return Ok(true);
+    }
+    Ok(ours(tail_cwds(file)?))
 }
 
 /// The main transcripts under `root`: `<root>/<folder>/<session>.jsonl`, never
@@ -148,12 +216,12 @@ fn main_transcripts(root: &Path) -> Vec<PathBuf> {
 /// Every message the owner typed in the main sessions of `project` after
 /// `since_ms` and at or before `until_ms`: 20 characters or longer, identical
 /// texts once (the oldest), secrets blanked, oldest first. A session belongs to
-/// the project its first working folder resolves to.
+/// every project a working folder in its first lines or its tail resolves to.
 #[doc(hidden)]
 pub fn collect_in_full(root: &Path, project: &str, since_ms: i64, until_ms: i64) -> Collected {
     let mut found: Vec<Said> = Vec::new();
     let mut unreadable = 0;
-    let mut belongs: HashMap<String, bool> = HashMap::new();
+    let mut resolved: HashMap<String, bool> = HashMap::new();
     for file in main_transcripts(root) {
         // A file nobody wrote to since the window opened holds nothing in it.
         let modified = std::fs::metadata(&file)
@@ -164,19 +232,13 @@ pub fn collect_in_full(root: &Path, project: &str, since_ms: i64, until_ms: i64)
         if modified.is_some_and(|m| m < since_ms) {
             continue;
         }
-        let cwd = match cwd_of(&file) {
-            Ok(Some(cwd)) => cwd,
-            Ok(None) => continue,
+        match session_of(&file, project, &mut resolved) {
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(_) => {
                 unreadable += 1;
                 continue;
             }
-        };
-        let ours = *belongs.entry(cwd.clone()).or_insert_with(|| {
-            crate::project::resolve_project(Path::new(&cwd)).is_some_and(|p| crate::project::same_project_name(&p, project))
-        });
-        if !ours {
-            continue;
         }
         let Ok(bytes) = std::fs::read(&file) else {
             unreadable += 1;
@@ -214,9 +276,11 @@ pub fn collect_in_full(root: &Path, project: &str, since_ms: i64, until_ms: i64)
 //    as `str::lines` does) and converted with the same lossy rule, so every line
 //    is the same text.
 // 2. A raw-byte test comes before any JSON parsing: `owner_text` only accepts a
-//    line whose `type` is the string "user", and such a line holds the bytes
-//    `"user"` (the writer, JSON.stringify, never escapes an ASCII letter). A line
-//    without those bytes is skipped unparsed. This is the one assumption.
+//    line whose `type` is the string "user", which holds the bytes `"user"`, or
+//    a message typed while a turn ran, an attachment of type `queued_command`,
+//    which holds the bytes `"queued_command"` (the writer, JSON.stringify, never
+//    escapes an ASCII letter). A line with neither is skipped unparsed. This is
+//    the one assumption.
 // 3. The window's upper end is applied when the list is assembled, not per
 //    line, so what a file gave can be kept and reused (see 4); the assembly
 //    filters, sorts and de-duplicates exactly as `collect_in_full` does, and
@@ -238,6 +302,7 @@ pub const TIME_BOX: Duration = Duration::from_secs(10);
 const GUARD_BYTES: u64 = 4096;
 
 const USER_NEEDLE: &[u8] = b"\"user\"";
+const QUEUED_NEEDLE: &[u8] = b"\"queued_command\"";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileProgress {
@@ -306,6 +371,7 @@ fn read_file(file: &Path, prior: Option<&FileProgress>, since_ms: i64, deadline:
         return FileRead::Unreadable;
     }
     let finder = memchr::memmem::Finder::new(USER_NEEDLE);
+    let queued = memchr::memmem::Finder::new(QUEUED_NEEDLE);
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, handle.take(len - state.offset));
     let mut raw = Vec::new();
     let mut open_line = Vec::new();
@@ -324,7 +390,7 @@ fn read_file(file: &Path, prior: Option<&FileProgress>, since_ms: i64, deadline:
         if let Some(rest) = body.strip_suffix(b"\r") {
             body = rest;
         }
-        let found = if finder.find(body).is_some() { said_of_line(&String::from_utf8_lossy(body), since_ms) } else { None };
+        let found = if finder.find(body).is_some() || queued.find(body).is_some() { said_of_line(&String::from_utf8_lossy(body), since_ms) } else { None };
         if whole {
             state.offset += raw.len() as u64;
             state.items.extend(found);
@@ -346,7 +412,7 @@ fn read_file(file: &Path, prior: Option<&FileProgress>, since_ms: i64, deadline:
 pub fn files_of(root: &Path, project: &str, since_ms: i64) -> (Vec<PathBuf>, usize) {
     let mut out = Vec::new();
     let mut unreadable = 0;
-    let mut belongs: HashMap<String, bool> = HashMap::new();
+    let mut resolved: HashMap<String, bool> = HashMap::new();
     for file in main_transcripts(root) {
         let modified = std::fs::metadata(&file)
             .and_then(|m| m.modified())
@@ -356,19 +422,10 @@ pub fn files_of(root: &Path, project: &str, since_ms: i64) -> (Vec<PathBuf>, usi
         if modified.is_some_and(|m| m < since_ms) {
             continue;
         }
-        let cwd = match cwd_of(&file) {
-            Ok(Some(cwd)) => cwd,
-            Ok(None) => continue,
-            Err(_) => {
-                unreadable += 1;
-                continue;
-            }
-        };
-        let ours = *belongs.entry(cwd.clone()).or_insert_with(|| {
-            crate::project::resolve_project(Path::new(&cwd)).is_some_and(|p| crate::project::same_project_name(&p, project))
-        });
-        if ours {
-            out.push(file);
+        match session_of(&file, project, &mut resolved) {
+            Ok(true) => out.push(file),
+            Ok(false) => {}
+            Err(_) => unreadable += 1,
         }
     }
     (out, unreadable)
@@ -377,7 +434,8 @@ pub fn files_of(root: &Path, project: &str, since_ms: i64) -> (Vec<PathBuf>, usi
 /// Every message the owner typed in the main sessions of `project` after
 /// `since_ms` and at or before `until_ms`: 20 characters or longer, identical
 /// texts once (the oldest), secrets blanked, oldest first. A session belongs to
-/// the project its first working folder resolves to. Reads under `deadline`
+/// every project a working folder in its first lines or its tail resolves to
+/// (`session_of`). Reads under `deadline`
 /// and goes on from `progress`; `None` when the deadline came first (the
 /// progress then holds what was read, and nothing of the list may be used).
 pub fn collect_resumable(root: &Path, project: &str, since_ms: i64, until_ms: i64, deadline: Option<Instant>, progress: &mut Progress) -> Option<Collected> {
@@ -815,6 +873,44 @@ mod tests {
         let texts: Vec<&str> = got.list.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, vec!["please always answer me in short sentences", "keep every commit message plain and short"]);
         assert_eq!(got.unreadable, 0);
+    }
+
+    #[test]
+    fn a_conversation_moved_into_the_project_later_is_on_its_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        let scratch = dir.path().join("scratch-workspace");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mine_json = mine.to_string_lossy().replace('\\', "\\\\");
+        // Begun in a folder of no project, then moved: the project's folder is
+        // named only after the first 200 lines.
+        let mut lines: Vec<String> = (1..=250).map(|i| user(&at(i), &format!("an early message in the scratch folder {i}"), "")).collect();
+        lines.push(user(&at(300), "the arms are printed in PPS from now on", "").replace("CWD", &mine_json));
+        session(&root, "a", "s1", &scratch, &lines);
+
+        let full = collect_in_full(&root, "demo", T0, T0 + 1_000_000);
+        assert_eq!(full.list.len(), 251, "every message of the session is the owner's, the moved one included");
+        assert!(full.list.iter().any(|s| s.text == "the arms are printed in PPS from now on"));
+        assert_eq!(collect_in(&root, "demo", T0, T0 + 1_000_000), full, "the fast reader gives the same list");
+        assert!(collect_in(&root, "elsewhere", T0, T0 + 1_000_000).list.is_empty(), "a project the session never worked in gets none of it");
+    }
+
+    #[test]
+    fn a_message_typed_while_a_turn_runs_is_on_the_list_of_both_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        let queued = format!(
+            r#"{{"isSidechain":false,"attachment":{{"type":"queued_command","prompt":"will the users notice this at all?","commandMode":"prompt","origin":{{"kind":"human"}},"humanTurn":true}},"type":"attachment","timestamp":"{}","cwd":"CWD"}}"#,
+            at(20)
+        );
+        session(&root, "a", "s1", &mine, &[user(&at(10), "please look at the reports of today", ""), queued]);
+
+        let full = collect_in_full(&root, "demo", T0, T0 + 1_000_000);
+        let texts: Vec<&str> = full.list.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["please look at the reports of today", "will the users notice this at all?"]);
+        assert_eq!(collect_in(&root, "demo", T0, T0 + 1_000_000), full, "the fast reader no longer skips it");
     }
 
     #[test]

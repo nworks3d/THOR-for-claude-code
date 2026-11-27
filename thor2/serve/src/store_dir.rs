@@ -202,8 +202,15 @@ pub fn lock_path_of(state: &Path) -> PathBuf {
 /// not there is `Some(None)` (start from nothing); a file that is there but
 /// cannot be read or parsed is `None`: the caller keeps the file and skips its
 /// update, never writing an empty state over it.
+///
+/// A file that holds nothing but NUL bytes or white space is `Some(None)`
+/// too: there is no state in it to keep. A power loss right after a write
+/// leaves a state file of the right size filled with NUL bytes (measured
+/// 2026-11-25: two state files written four minutes before an unexpected
+/// shutdown), and keeping it would skip every later update for good.
 pub fn read_json_for_update<T: serde::de::DeserializeOwned>(path: &Path) -> Option<Option<T>> {
     match std::fs::read_to_string(path) {
+        Ok(text) if text.trim_matches(|c: char| c == '\0' || c.is_whitespace()).is_empty() => Some(None),
         Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}')).ok().map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
         Err(_) => None,
@@ -265,6 +272,18 @@ mod tests {
         assert_eq!(read_json_for_update::<Vec<String>>(&state), None);
         std::fs::write(&state, "[\"a\"]").unwrap();
         assert_eq!(read_json_for_update::<Vec<String>>(&state), Some(Some(vec!["a".to_string()])));
+    }
+
+    #[test]
+    fn a_state_file_a_power_loss_filled_with_nul_bytes_starts_again_from_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        std::fs::write(&state, vec![0u8; 21015]).unwrap();
+        assert_eq!(read_json_for_update::<Vec<String>>(&state), Some(None), "no state in it to keep");
+        std::fs::write(&state, "").unwrap();
+        assert_eq!(read_json_for_update::<Vec<String>>(&state), Some(None));
+        std::fs::write(&state, "\0\0[\"a\"]").unwrap();
+        assert_eq!(read_json_for_update::<Vec<String>>(&state), None, "a file with text in it is still kept");
     }
 
     #[test]
